@@ -57,8 +57,8 @@ data class AppConfig(
     val darkMode: Boolean = false,
     /** 消息正文显示字号（sp），12f..20f，默认 14f */
     val messageFontSize: Float = 14f,
-    /** 主题模式：light / dark / system */
-    val themeMode: String = "dark",
+    /** 主题模式：light / dark / system（默认跟随系统） */
+    val themeMode: String = "system",
     /** 强调色：blue / green / purple / orange / teal / pink */
     val accentColor: String = "blue",
     /** Super Chat（Agent 模式）开关：开启后模型可自主调用工具 */
@@ -247,7 +247,7 @@ class AppRepository(private val context: Context) {
         val activeId = prefs[Keys.activeModelId] ?: models.firstOrNull()?.id ?: ""
         val dark = prefs[Keys.darkMode] ?: false
         val font = prefs[Keys.messageFontSize] ?: 14f
-        val themeMode = prefs[Keys.themeMode] ?: if (dark) "dark" else "light"
+        val themeMode = prefs[Keys.themeMode] ?: if (dark) "dark" else "system"
         val accent = prefs[Keys.accentColor] ?: "blue"
         val superChat = prefs[Keys.superChat] ?: false
         val threshold = prefs[Keys.toolApprovalThreshold] ?: 3

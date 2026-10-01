@@ -174,3 +174,8 @@ application-label: AI Chat
 ### 版本
 - 版本号重置为 **1.0.0**（移除 GitPark 上全部历史 release）；
 - App 内「关于」版本号改为读取实际版本（不再硬编码）。
+
+### v1.0.0 补充（正式 Release）
+- 主题默认改为**跟随系统**深色模式（新装用户随系统；旧暗色用户保留暗色）
+- Release 构建启用：R8 混淆 + 资源压缩 + debug 签名（个人分发可安装）；proguard 保留 Gson 数据模型与工具类
+- 发布 GitHub Release v1.0.0

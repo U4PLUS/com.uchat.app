@@ -20,6 +20,8 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            // 个人分发：暂用 debug 签名，保证产物可直接安装；上架前替换正式签名
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
