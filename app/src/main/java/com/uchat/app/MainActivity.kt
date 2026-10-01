@@ -1,4 +1,4 @@
-package com.aichat.app
+package com.uchat.app
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -7,10 +7,10 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.aichat.app.ui.AIChatApp
-import com.aichat.app.ui.UiIntent
-import com.aichat.app.viewmodel.ChatViewModel
-import com.aichat.app.viewmodel.ChatViewModelFactory
+import com.uchat.app.ui.AIChatApp
+import com.uchat.app.ui.UiIntent
+import com.uchat.app.viewmodel.ChatViewModel
+import com.uchat.app.viewmodel.ChatViewModelFactory
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

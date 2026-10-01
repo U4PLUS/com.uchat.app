@@ -1,9 +1,9 @@
-package com.aichat.app
+package com.uchat.app
 
 import android.app.Application
 import android.content.Intent
-import com.aichat.app.data.AppRepository
-import com.aichat.app.tools.ToolRegistry
+import com.uchat.app.data.AppRepository
+import com.uchat.app.tools.ToolRegistry
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter

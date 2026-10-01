@@ -1,4 +1,4 @@
-package com.aichat.app.data
+package com.uchat.app.data
 
 import android.content.Context
 import androidx.datastore.core.DataStore

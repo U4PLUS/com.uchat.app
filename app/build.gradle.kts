@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.aichat.app"
+    namespace = "com.uchat.app"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.aichat.app"
+        applicationId = "com.uchat.app"
         minSdk = 21
         targetSdk = 34
         versionCode = 1

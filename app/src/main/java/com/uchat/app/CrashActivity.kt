@@ -1,4 +1,4 @@
-package com.aichat.app
+package com.uchat.app
 
 import android.app.Activity
 import android.content.ClipData
@@ -33,7 +33,7 @@ class CrashActivity : Activity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "AI Chat 遇到问题"
+            text = "Chat Client 遇到问题"
             setTextColor(Color.WHITE)
             textSize = 20f
             typeface = Typeface.DEFAULT_BOLD

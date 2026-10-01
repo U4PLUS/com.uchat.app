@@ -1,8 +1,8 @@
-package com.aichat.app.tools
+package com.uchat.app.tools
 
 import android.content.Context
 import android.os.Build
-import com.aichat.app.data.ToolDef
+import com.uchat.app.data.ToolDef
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File

@@ -1,22 +1,22 @@
-package com.aichat.app.viewmodel
+package com.uchat.app.viewmodel
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import android.content.Context
 import android.os.Build
-import com.aichat.app.data.ApiTestResult
-import com.aichat.app.data.AppConfig
-import com.aichat.app.data.AppRepository
-import com.aichat.app.data.Chat
-import com.aichat.app.data.ChatMessage
-import com.aichat.app.data.ModelConfig
-import com.aichat.app.data.OpenCodeFreeModel
-import com.aichat.app.data.OpenCodeSpeedResult
-import com.aichat.app.data.SendAttachment
-import com.aichat.app.data.ToolCallData
-import com.aichat.app.data.ToolDef
-import com.aichat.app.tools.ToolRegistry
+import com.uchat.app.data.ApiTestResult
+import com.uchat.app.data.AppConfig
+import com.uchat.app.data.AppRepository
+import com.uchat.app.data.Chat
+import com.uchat.app.data.ChatMessage
+import com.uchat.app.data.ModelConfig
+import com.uchat.app.data.OpenCodeFreeModel
+import com.uchat.app.data.OpenCodeSpeedResult
+import com.uchat.app.data.SendAttachment
+import com.uchat.app.data.ToolCallData
+import com.uchat.app.data.ToolDef
+import com.uchat.app.tools.ToolRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -778,7 +778,7 @@ class ChatViewModel(
 
 class ChatViewModelFactory(
     private val repository: AppRepository,
-    private val toolRegistry: com.aichat.app.tools.ToolRegistry,
+    private val toolRegistry: com.uchat.app.tools.ToolRegistry,
     private val appContext: Context
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")

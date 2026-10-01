@@ -8,3 +8,4 @@ local.properties
 *.log
 captures/
 .DS_Store
+.tools/

@@ -1,6 +1,6 @@
 @file:OptIn(ExperimentalMaterial3Api::class)
 
-package com.aichat.app.ui
+package com.uchat.app.ui
 
 import android.content.ClipboardManager
 import android.content.Context
@@ -60,17 +60,17 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
-import com.aichat.app.data.ChatMessage
-import com.aichat.app.data.CodeBlock
-import com.aichat.app.data.ModelConfig
-import com.aichat.app.data.OpenCodeFreeModel
-import com.aichat.app.data.OpenCodeSpeedResult
-import com.aichat.app.data.SendAttachment
-import com.aichat.app.data.ToolCallData
+import com.uchat.app.data.ChatMessage
+import com.uchat.app.data.CodeBlock
+import com.uchat.app.data.ModelConfig
+import com.uchat.app.data.OpenCodeFreeModel
+import com.uchat.app.data.OpenCodeSpeedResult
+import com.uchat.app.data.SendAttachment
+import com.uchat.app.data.ToolCallData
 import kotlinx.coroutines.launch
-import com.aichat.app.data.parseMarkdown
-import com.aichat.app.data.parseMarkdownSegments
-import com.aichat.app.viewmodel.ChatUiState
+import com.uchat.app.data.parseMarkdown
+import com.uchat.app.data.parseMarkdownSegments
+import com.uchat.app.viewmodel.ChatUiState
 import java.text.SimpleDateFormat
 
 private val LightColors = lightColorScheme(
@@ -302,7 +302,7 @@ fun DrawerContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit, onClose: (
             modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 18.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("AI Chat", fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text("Chat Client", fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             IconButton(onClick = { onIntent(UiIntent.NewChat); onClose() }) {
                 Icon(Icons.Default.Add, contentDescription = "新建对话", modifier = Modifier.size(22.dp))
             }
@@ -353,7 +353,7 @@ fun DrawerContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit, onClose: (
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DrawerChatItem(
-    chat: com.aichat.app.data.Chat,
+    chat: com.uchat.app.data.Chat,
     selected: Boolean,
     onClick: () -> Unit,
     onDelete: () -> Unit,
@@ -722,7 +722,7 @@ fun ChatScreen(
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(Icons.AutoMirrored.Filled.Chat, null, modifier = Modifier.size(46.dp), tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.45f))
                                 Spacer(modifier = Modifier.height(14.dp))
-                                Text("AI Chat", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
+                                Text("Chat Client", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
                                 Spacer(modifier = Modifier.height(6.dp))
                                 if (uiState.config.models.isEmpty()) {
                                     Text("还没有可用模型", color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), fontSize = 14.sp)
@@ -1417,7 +1417,7 @@ private fun SettingsHomeList(uiState: ChatUiState, onIntent: (UiIntent) -> Unit,
         SettingsRow(
             icon = Icons.Default.Info,
             title = "关于",
-            subtitle = "AI Chat v$appVersion",
+            subtitle = "Chat Client v$appVersion",
             onClick = { onOpen("about") }
         )
     }
@@ -2040,7 +2040,7 @@ private fun AboutTabContent() {
             shape = RoundedCornerShape(12.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("AI Chat", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("Chat Client", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("版本 1.3.0", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(modifier = Modifier.height(8.dp))
@@ -2129,7 +2129,7 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
         }
 
         // 思考等级：仅免费网关 + 支持思考的模型
-        val freeCaps = com.aichat.app.data.OpenCodeCatalog.capabilitiesOf(model.model)
+        val freeCaps = com.uchat.app.data.OpenCodeCatalog.capabilitiesOf(model.model)
         if (model.freeGatewayFingerprint && freeCaps.reasoning) {
             Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column {
@@ -2155,7 +2155,7 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 levels.forEach { (level, label) ->
-                    val budget = com.aichat.app.data.OpenCodeEffort.budgetLabel(level, model.model)
+                    val budget = com.uchat.app.data.OpenCodeEffort.budgetLabel(level, model.model)
                     FilterChip(
                         selected = model.thinkingLevel == level,
                         onClick = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinkingLevel = level))) },
@@ -2285,7 +2285,7 @@ private fun EditField(
 }
 
 @Composable
-private fun ApiTestResultRow(result: com.aichat.app.data.ApiTestResult) {
+private fun ApiTestResultRow(result: com.uchat.app.data.ApiTestResult) {
     val (icon, color) = if (result.success) Icons.Default.CheckCircle to Color(0xFF1E8E3E) else Icons.Default.Error to MaterialTheme.colorScheme.error
     Surface(
         modifier = Modifier.fillMaxWidth(),
