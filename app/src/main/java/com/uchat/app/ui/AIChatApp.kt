@@ -45,6 +45,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontFamily
@@ -2033,6 +2034,12 @@ private fun DataTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
 
 @Composable
 private fun AboutTabContent() {
+    val context = LocalContext.current
+    val appVersion = remember {
+        runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }
+            .getOrNull() ?: "1.0.0"
+    }
+    val uriHandler = LocalUriHandler.current
     Column(modifier = Modifier.fillMaxWidth()) {
         Surface(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
@@ -2042,13 +2049,25 @@ private fun AboutTabContent() {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text("Chat Client", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(4.dp))
-                Text("版本 1.3.0", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("版本 v$appVersion", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "支持 OpenAI 兼容 API，流式输出（打字机效果），多模型切换，内置 Our Free Model 免费模型（免 Key），备份/恢复，本地数据存储。\n内置 ISRG Root X1 证书信任，兼容 Android 5+ 旧设备的 HTTPS 连接。",
+                    "支持 OpenAI 兼容 API，流式输出（打字机效果），多模型切换，免费模型（免 Key）通道，备份/恢复，本地数据存储。\n内置 ISRG Root X1 证书信任，兼容 Android 5+ 旧设备的 HTTPS 连接。",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    "GitHub 开源仓库",
+                    fontSize = 12.5.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    textDecoration = TextDecoration.Underline,
+                    modifier = Modifier.clickable {
+                        uriHandler.openUri("https://github.com/U4PLUS/com.uchat.app")
+                    }
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("By U400A1/DeepSeek", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))
             }
         }
     }
@@ -2088,7 +2107,7 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
                 shape = RoundedCornerShape(8.dp)
             ) {
                 Text(
-                    "⚡ Our Free Model 免费网关已启用：自动附带 opencode 指纹头与工具声明，免费通道仅支持流式输出；API Key 固定为 public，模型名请在网关返回的清单中选择。",
+                    "⚡ 已启用免费模型网关（免 Key）：自动附带 opencode 指纹头与工具声明，免费通道仅支持流式输出；API Key 固定为 public，模型名请在网关返回的清单中选择。",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(10.dp)
