@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <!-- 内置 ISRG Root X1，解决旧设备（Android 7+ 此配置生效；
+                 Android 5/6 由代码层 TlsConfig 追加信任）HTTPS 证书链校验失败 -->
+            <certificates src="@raw/isrg_root_x1" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
