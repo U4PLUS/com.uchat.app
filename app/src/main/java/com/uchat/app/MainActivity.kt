@@ -60,14 +60,16 @@ class MainActivity : ComponentActivity() {
                         is UiIntent.ClearExportPayload -> { viewModel.clearExportPayload() }
                         is UiIntent.ImportBackup -> { viewModel.importData(intent.json) }
                         is UiIntent.ClearAllData -> { viewModel.clearAllData() }
-                        is UiIntent.FetchOpenCodeModels -> { viewModel.fetchOpenCodeFreeModels() }
-                        is UiIntent.AddOpenCodeModel -> { viewModel.addOpenCodeModel(intent.modelId) }
                         is UiIntent.AddAttachment -> { viewModel.addAttachment(intent.attachment) }
                         is UiIntent.RemoveAttachment -> { viewModel.removeAttachment(intent.index) }
                         is UiIntent.SetThemeMode -> { viewModel.setThemeMode(intent.mode) }
                         is UiIntent.SetAccentColor -> { viewModel.setAccentColor(intent.color) }
-                        is UiIntent.ToggleSuperChat -> { viewModel.toggleSuperChat() }
                         is UiIntent.SetApprovalThreshold -> { viewModel.setApprovalThreshold(intent.level) }
+                        is UiIntent.SetMaxAutoRounds -> { viewModel.setMaxAutoRounds(intent.rounds) }
+                        is UiIntent.SetContextLimitK -> { viewModel.setContextLimitK(intent.k) }
+                        is UiIntent.LoadMemories -> { viewModel.loadMemories() }
+                        is UiIntent.DeleteMemory -> { viewModel.deleteMemory(intent.id) }
+                        is UiIntent.ClearMemories -> { viewModel.clearMemories() }
                         is UiIntent.ApproveTool -> { viewModel.approveTool(intent.allow) }
                     }
                 }

@@ -19,6 +19,12 @@ import java.util.Locale
  */
 class ToolRegistry(private val context: Context) {
 
+    /** 记忆系统回调（由上层注入，与存储解耦） */
+    var memoryOps: com.uchat.app.data.MemoryOps? = null
+
+    /** 联网能力回调（web_search / fetch_page 由上层注入，复用内置证书信任） */
+    var netOps: com.uchat.app.data.NetOps? = null
+
     /** 工具定义列表（随每个请求发给模型的 tools 数组） */
     val definitions: List<ToolDef> = listOf(
         ToolDef(
@@ -41,6 +47,41 @@ class ToolRegistry(private val context: Context) {
             description = "在沙箱 shell 中执行命令（内置 busybox，全架构兼容）。白名单命令：echo cat grep egrep sed awk sort head tail wc date cut tr uniq base64 printf ls find stat bc expr seq fold pwd id whoami uname uptime df du free touch mkdir tee cp xargs yes wget tar gzip gunzip md5sum sha1sum sha256sum od xxd which env time。仅 wget 可以联网（HTTP/HTTPS，用于下载/抓取）。禁止绝对路径、禁止 '..'、禁止重定向，禁止 rm/chmod/chown/mv/su/curl 等破坏性或提权命令。工作目录为 App 私有沙箱目录。",
             parameters = """{"type":"object","properties":{"command":{"type":"string","description":"要执行的 shell 命令，如：echo hello 或 grep -n error notes.txt 或 wget -qO page.html https://example.com"}},"required":["command"]}""",
             dangerLevel = 2
+        ),
+        ToolDef(
+            id = "web_search",
+            name = "web_search",
+            description = "联网搜索互联网（免费额度，无需 API Key）。查询最新资讯、实时事件、用户提到的陌生名词、验证事实时调用。返回若干条排名结果（标题/链接/摘要），需要详细内容时再用 fetch_page 打开链接。",
+            parameters = """{"type":"object","properties":{"query":{"type":"string","description":"搜索关键词，尽量具体，如：2026年世界杯赛程"}},"required":["query"]}""",
+            dangerLevel = 1
+        ),
+        ToolDef(
+            id = "fetch_page",
+            name = "fetch_page",
+            description = "抓取指定网页的正文内容（Markdown，自动截断到约 8000 字符）。用于阅读 web_search 结果中的链接、获取完整文章内容。仅限公开页面，不支持登录/私有页面。",
+            parameters = """{"type":"object","properties":{"url":{"type":"string","description":"要抓取的完整网址，如 https://example.com/article"}},"required":["url"]}""",
+            dangerLevel = 1
+        ),
+        ToolDef(
+            id = "remember_memory",
+            name = "remember_memory",
+            description = "把关于用户的重要信息（偏好、身份、习惯、事实）保存进长期记忆，跨会话有效。当用户明确说「记住…」、表达偏好、透露个人事实时调用。参数 content 为记忆内容（写成陈述句）。",
+            parameters = """{"type":"object","properties":{"content":{"type":"string","description":"要保存的记忆内容，如：用户喜欢简洁回答"},"importance":{"type":"string","enum":["low","normal","high"],"description":"重要程度，默认 normal"}},"required":["content"]}""",
+            dangerLevel = 1
+        ),
+        ToolDef(
+            id = "recall_memories",
+            name = "recall_memories",
+            description = "检索长期记忆中关于用户的已知信息（偏好、身份、习惯、历史事实）。回答涉及用户个人化问题或需要回忆之前对话内容时先调用它，避免忘记用户之前说过的话。",
+            parameters = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词，如：偏好 或 工作"}},"required":["query"]}""",
+            dangerLevel = 1
+        ),
+        ToolDef(
+            id = "send_file",
+            name = "send_file",
+            description = "向用户发送一个文件，聊天中会展示为文件卡片供用户点击下载。用于把找到/生成的文件交付给用户：给出文件名（含扩展名）与可下载的 http(s) 地址（如 run_shell 中 wget 下载的文件，或你已知的直链）。文件类型由扩展名决定展示图标。",
+            parameters = """{"type":"object","properties":{"name":{"type":"string","description":"文件名，需含扩展名，如 report.pdf 或 app.apk"},"url":{"type":"string","description":"文件的 http(s) 下载直链"}},"required":["name","url"]}""",
+            dangerLevel = 1
         )
     )
 
@@ -69,7 +110,7 @@ class ToolRegistry(private val context: Context) {
         }
     }
 
-    private fun doExecute(name: String, argumentsJson: String): String = when (name) {
+    private suspend fun doExecute(name: String, argumentsJson: String): String = when (name) {
         "calculator" -> {
             val expr = parseArg(argumentsJson, "expression")
             if (expr.isBlank()) "错误：缺少参数 expression"
@@ -85,6 +126,36 @@ class ToolRegistry(private val context: Context) {
             "当前本地时间：${fmt.format(Date())}"
         }
         "run_shell" -> runSafeShell(parseArg(argumentsJson, "command"))
+        "web_search" -> {
+            val query = parseArg(argumentsJson, "query")
+            if (query.isBlank()) "错误：缺少参数 query"
+            else netOps?.webSearch(query, 5) ?: "错误：联网搜索未就绪"
+        }
+        "fetch_page" -> {
+            val url = parseArg(argumentsJson, "url")
+            if (url.isBlank()) "错误：缺少参数 url"
+            else netOps?.fetchPage(url) ?: "错误：联网抓取未就绪"
+        }
+        "remember_memory" -> {
+            val content = parseArg(argumentsJson, "content")
+            val importance = parseArg(argumentsJson, "importance").ifBlank { "normal" }
+            if (content.isBlank()) "错误：缺少参数 content"
+            else memoryOps?.saveMemory(content, importance) ?: "错误：记忆系统未就绪"
+        }
+        "recall_memories" -> {
+            val query = parseArg(argumentsJson, "query")
+            if (query.isBlank()) "错误：缺少参数 query"
+            else memoryOps?.recallMemories(query) ?: "错误：记忆系统未就绪"
+        }
+        "send_file" -> {
+            val name = parseArg(argumentsJson, "name").trim()
+            val url = parseArg(argumentsJson, "url").trim()
+            when {
+                name.isBlank() -> "错误：缺少参数 name（文件名，含扩展名）"
+                !url.startsWith("http://") && !url.startsWith("https://") -> "错误：url 必须是 http(s) 下载直链"
+                else -> "【文件卡片】$name|$url"
+            }
+        }
         else -> "错误：未知工具 $name"
     }
 

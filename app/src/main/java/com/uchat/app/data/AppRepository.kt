@@ -11,6 +11,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.sp
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -24,7 +25,6 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLSocketFactory
 
@@ -41,13 +41,7 @@ data class ModelConfig(
     val stream: Boolean = true,
     val thinking: Boolean = false,
     /** 附加到每次请求的自定义请求头（发消息 / 测试连接 / 获取模型列表） */
-    val customHeaders: Map<String, String> = emptyMap(),
-    /** Our Free Model 免费网关（opencode.ai 免密车道）：自动注入 opencode 指纹头、
-     *  声明工具指纹、强制流式输出，无需额外配置 */
-    val freeGatewayFingerprint: Boolean = false,
-    /** 思考等级：off / light / balanced / deep（仅免费网关中支持思考的模型生效，
-     *  对应输出预算 关闭 / 2K / 8K / 模型上限） */
-    val thinkingLevel: String = "balanced"
+    val customHeaders: Map<String, String> = emptyMap()
 )
 
 data class AppConfig(
@@ -61,10 +55,13 @@ data class AppConfig(
     val themeMode: String = "system",
     /** 强调色：blue / green / purple / orange / teal / pink */
     val accentColor: String = "blue",
-    /** Super Chat（Agent 模式）开关：开启后模型可自主调用工具 */
-    val superChat: Boolean = false,
+    /** Agent（Super Chat）模式为默认常开，模型可自主调用工具 */
     /** 工具授权阈值：dangerLevel >= 该值的工具调用需用户确认（2=敏感级起，3=高风险级起，4=全部自动） */
     val toolApprovalThreshold: Int = 3,
+    /** AI 自主续写轮数上限：对话 JSON 协议 done=false 时自动续写；0 = 无限 */
+    val maxAutoRounds: Int = 10,
+    /** 上下文压缩阈值（k token，0 = 不压缩）：历史消息估算超过时，最旧部分用 AI 摘要压缩 */
+    val contextLimitK: Int = 128,
 )
 
 data class ChatMessage(
@@ -113,6 +110,32 @@ data class Chat(
     val lastUpdated: Long = System.currentTimeMillis()
 )
 
+/** 记忆条目：AI 通过 remember_memory 工具保存的用户长期信息（跨会话有效） */
+data class MemoryEntry(
+    val id: String = "",
+    val content: String = "",
+    /** low / normal / high */
+    val importance: String = "normal",
+    val createdAt: Long = 0L,
+    val updatedAt: Long = 0L
+)
+
+/** 记忆系统回调：ToolRegistry 与存储解耦，由 AppRepository 实现 */
+interface MemoryOps {
+    /** 保存一条记忆，返回给模型看的简短结果文本 */
+    suspend fun saveMemory(content: String, importance: String): String
+    /** 按关键词检索记忆，返回给模型看的格式化文本 */
+    suspend fun recallMemories(query: String): String
+}
+
+/** 联网能力回调：web_search / fetch_page 由 AppRepository 实现（复用内置证书信任） */
+interface NetOps {
+    /** 联网搜索（Firecrawl keyless，失败自动降级 Keenable），返回给模型看的格式化结果 */
+    suspend fun webSearch(query: String, maxResults: Int): String
+    /** 抓取公开网页正文（Firecrawl keyless scrape，Markdown 截断） */
+    suspend fun fetchPage(url: String): String
+}
+
 data class CodeBlock(
     val language: String,
     val code: String,
@@ -120,14 +143,24 @@ data class CodeBlock(
     val endIndex: Int,
 )
 
+/** 内联链接位置：偏移相对所属 plain 段文本，供 UI 层点击命中判断 */
+data class LinkPos(
+    val start: Int,
+    val end: Int,
+    val label: String,
+    val url: String
+)
+
 /**
  * Markdown segments — used by AIChatApp to render mixed code + prose content.
  * plainSegments: ordered list of (annotatedString, rawText) for non-code-block regions
  * codeBlocks: ordered list of extracted fenced code blocks
+ * links: 与 plainSegments 索引对齐的段内链接位置
  */
 data class MarkdownSegments(
     val plainSegments: List<Pair<AnnotatedString, String>>,
     val codeBlocks: List<CodeBlock>,
+    val links: List<List<LinkPos>> = emptyList(),
 )
 
 fun parseMarkdown(text: String, isDark: Boolean): Pair<AnnotatedString, List<CodeBlock>> {
@@ -142,6 +175,7 @@ fun parseMarkdown(text: String, isDark: Boolean): Pair<AnnotatedString, List<Cod
 fun parseMarkdownSegments(text: String, isDark: Boolean): MarkdownSegments {
     val codeBg = if (isDark) Color(0xFF2D2D2D) else Color(0xFFF0F0F0)
     val codeText = if (isDark) Color(0xFF9CDCFE) else Color(0xFF0066CC)
+    val linkColor = if (isDark) Color(0xFF82AAFF) else Color(0xFF1565C0)
 
     // 1. Extract fenced code blocks with positions
     val codeBlockRegex = Regex("""```(\w*)[\s\S]*?```""")
@@ -150,8 +184,11 @@ fun parseMarkdownSegments(text: String, isDark: Boolean): MarkdownSegments {
         val raw = match.value
         val firstNewline = raw.indexOf('\n')
         val lang = if (firstNewline > 3) raw.substring(3, firstNewline).trim() else ""
-        val inner = if (firstNewline > 0 && raw.endsWith("```")) {
-            raw.substring(firstNewline + 1, raw.length - 4)
+        // 内容区间：firstNewline 之后到结尾 ``` 之前（去掉围栏行）；空代码块（```\n```）安全返回空串
+        val innerEnd = if (raw.endsWith("```")) raw.length - 3 else raw.length
+        val inner = if (firstNewline > 0) {
+            val begin = firstNewline + 1
+            if (begin < innerEnd) raw.substring(begin, innerEnd) else ""
         } else {
             raw.substring(firstNewline + 1)
         }
@@ -160,60 +197,101 @@ fun parseMarkdownSegments(text: String, isDark: Boolean): MarkdownSegments {
 
     // 2. Split text into plain regions between code blocks
     val plainSegments = mutableListOf<Pair<AnnotatedString, String>>()
+    val allLinks = mutableListOf<List<LinkPos>>()
     var pos = 0
     for (block in codeBlocks) {
         if (block.startIndex > pos) {
             val plain = text.substring(pos, block.startIndex)
-            plainSegments.add(Pair(buildAnnotated(plain, codeBg, codeText), plain))
+            val links = mutableListOf<LinkPos>()
+            plainSegments.add(Pair(buildAnnotated(plain, codeBg, codeText, linkColor, links), plain))
+            allLinks.add(links)
         }
         pos = block.endIndex
     }
     if (pos < text.length) {
         val plain = text.substring(pos)
-        plainSegments.add(Pair(buildAnnotated(plain, codeBg, codeText), plain))
+        val links = mutableListOf<LinkPos>()
+        plainSegments.add(Pair(buildAnnotated(plain, codeBg, codeText, linkColor, links), plain))
+        allLinks.add(links)
     }
     if (plainSegments.isEmpty()) {
-        plainSegments.add(Pair(buildAnnotated("", codeBg, codeText), ""))
+        plainSegments.add(Pair(buildAnnotated("", codeBg, codeText, linkColor, mutableListOf()), ""))
+        allLinks.add(emptyList())
     }
 
-    return MarkdownSegments(plainSegments, codeBlocks)
+    return MarkdownSegments(plainSegments, codeBlocks, allLinks)
 }
 
-private fun buildAnnotated(text: String, codeBg: Color, codeText: Color): AnnotatedString {
+private fun buildAnnotated(text: String, codeBg: Color, codeText: Color, linkColor: Color, links: MutableList<LinkPos>): AnnotatedString {
     return buildAnnotatedString {
+        var col = 0
         val lines = text.split("\n")
         for (line in lines) {
             when {
-                line.startsWith("```") -> append("\n")
-                line.startsWith("# ") -> { pushStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 22.sp)); append(line.removePrefix("# ")); pop(); append("\n") }
-                line.startsWith("## ") -> { pushStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 18.sp)); append(line.removePrefix("## ")); pop(); append("\n") }
-                line.startsWith("### ") -> { pushStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 16.sp)); append(line.removePrefix("### ")); pop(); append("\n") }
-                line.startsWith("- ") || line.startsWith("* ") -> { append("  \u2022  "); append(line.drop(2)); append("\n") }
-                line.startsWith("> ") -> { pushStyle(SpanStyle(fontStyle = FontStyle.Italic, color = Color.Gray)); append("  \u2507 "); append(line.drop(2)); pop(); append("\n") }
-                line == "---" || line == "***" -> { append("─────────────────────────────────\n") }
-                line.contains("`") -> parseInlineCode(line, codeBg, codeText)
-                else -> { append(line); append("\n") }
+                line.startsWith("```") -> { append("\n"); col += 1 }
+                line.startsWith("# ") -> { val v = line.removePrefix("# "); pushStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 22.sp)); append(v); pop(); append("\n"); col += v.length + 1 }
+                line.startsWith("## ") -> { val v = line.removePrefix("## "); pushStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 18.sp)); append(v); pop(); append("\n"); col += v.length + 1 }
+                line.startsWith("### ") -> { val v = line.removePrefix("### "); pushStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 16.sp)); append(v); pop(); append("\n"); col += v.length + 1 }
+                line.startsWith("- ") || line.startsWith("* ") -> {
+                    append("  \u2022  "); col += 5
+                    col += appendInlineRich(line.drop(2), linkColor, links)
+                    append("\n"); col += 1
+                }
+                line.startsWith("> ") -> {
+                    pushStyle(SpanStyle(fontStyle = FontStyle.Italic, color = Color.Gray))
+                    append("  \u2507 "); col += 4
+                    col += appendInlineRich(line.drop(2), linkColor, links)
+                    pop(); append("\n"); col += 1
+                }
+                line == "---" || line == "***" -> { append("─────────────────────────────────\n"); col += 34 }
+                line.contains("`") -> { col += parseInlineCode(line, codeBg, codeText, linkColor, links) }
+                else -> { col += appendInlineRich(line, linkColor, links); append("\n"); col += 1 }
             }
         }
     }
 }
 
-private fun AnnotatedString.Builder.parseInlineCode(line: String, bg: Color, textColor: Color) {
+private fun AnnotatedString.Builder.parseInlineCode(line: String, bg: Color, textColor: Color, linkColor: Color, links: MutableList<LinkPos>): Int {
+    var col = 0
     var i = 0
     while (i < line.length) {
         val start = line.indexOf('`', i)
-        if (start == -1) { append(line.substring(i)); append("\n"); break }
-        if (start > i) append(line.substring(i, start))
+        if (start == -1) { col += appendInlineRich(line.substring(i), linkColor, links); append("\n"); return col + 1 }
+        if (start > i) col += appendInlineRich(line.substring(i, start), linkColor, links)
         val end = line.indexOf('`', start + 1)
-        if (end == -1) { append(line.substring(start)); append("\n"); break }
+        if (end == -1) { col += appendInlineRich(line.substring(start), linkColor, links); append("\n"); return col + 1 }
         pushStyle(SpanStyle(background = bg, fontFamily = FontFamily.Monospace, color = textColor))
         append(line.substring(start, end + 1))
         pop()
+        col += end - start + 1
         i = end + 1
     }
+    append("\n")
+    return col + 1
 }
 
-class AppRepository(private val context: Context) {
+/** 行内富文本：[text](url) 链接 与 裸 URL 渲染为下划线链接样式，位置记入 links（偏移相对当前 plain 段） */
+private fun AnnotatedString.Builder.appendInlineRich(text: String, linkColor: Color, links: MutableList<LinkPos>): Int {
+    if (text.isEmpty()) return 0
+    val regex = Regex("""\[([^\]]+)\]\((https?://[^)\s]+)\)|(https?://[^\s\)\]<>]+)""")
+    val matches = regex.findAll(text).toList()
+    if (matches.isEmpty()) { append(text); return text.length }
+    var col = 0
+    for (m in matches) {
+        if (m.range.first > col) { append(text.substring(col, m.range.first)); col = m.range.first }
+        val label = m.groups[1]?.value ?: m.groups[3]!!.value
+        val url = m.groups[2]?.value ?: m.groups[3]!!.value
+        pushStyle(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline))
+        append(label)
+        pop()
+        links.add(LinkPos(col, col + label.length, label, url))
+        col += label.length
+    }
+    if (col < text.length) append(text.substring(col))
+    return text.length
+}
+
+class AppRepository(private val context: Context) : MemoryOps, NetOps {
     private val gson = Gson()
 
     /** 内置 ISRG Root X1 信任 + TLS1.2 的 SocketFactory（失败时回退系统默认） */
@@ -226,8 +304,10 @@ class AppRepository(private val context: Context) {
         val messageFontSize = floatPreferencesKey("message_font_size_v2")
         val themeMode = stringPreferencesKey("theme_mode_v2")
         val accentColor = stringPreferencesKey("accent_color_v2")
-        val superChat = booleanPreferencesKey("super_chat_v2")
         val toolApprovalThreshold = intPreferencesKey("tool_approval_threshold_v2")
+        val maxAutoRounds = intPreferencesKey("max_auto_rounds_v2")
+        val contextLimitK = intPreferencesKey("context_limit_k_v2")
+        val memories = stringPreferencesKey("memories_v2")
         val chats = stringPreferencesKey("chats_v2")
     }
 
@@ -236,12 +316,7 @@ class AppRepository(private val context: Context) {
         val models: List<ModelConfig> = if (modelsJson != null) {
             try {
                 val type = object : TypeToken<List<ModelConfig>>() {}.type
-                gson.fromJson<List<ModelConfig>>(modelsJson, type).map { m ->
-                    // 旧版本配置无 thinkingLevel 字段（Gson 解码为 null）：免费模型默认均衡，其余关闭
-                    if (m.thinkingLevel == null) {
-                        m.copy(thinkingLevel = if (m.freeGatewayFingerprint) "balanced" else "off")
-                    } else m
-                }
+                gson.fromJson<List<ModelConfig>>(modelsJson, type)
             } catch (_: Exception) { AppConfig().models }
         } else { AppConfig().models }
         val activeId = prefs[Keys.activeModelId] ?: models.firstOrNull()?.id ?: ""
@@ -249,11 +324,13 @@ class AppRepository(private val context: Context) {
         val font = prefs[Keys.messageFontSize] ?: 14f
         val themeMode = prefs[Keys.themeMode] ?: if (dark) "dark" else "system"
         val accent = prefs[Keys.accentColor] ?: "blue"
-        val superChat = prefs[Keys.superChat] ?: false
         val threshold = prefs[Keys.toolApprovalThreshold] ?: 3
+        val maxAutoRounds = prefs[Keys.maxAutoRounds] ?: 10
+        val contextLimitK = prefs[Keys.contextLimitK] ?: 128
         AppConfig(models = models, activeModelId = activeId, darkMode = dark,
                   messageFontSize = font, themeMode = themeMode, accentColor = accent,
-                  superChat = superChat, toolApprovalThreshold = threshold)
+                  toolApprovalThreshold = threshold, maxAutoRounds = maxAutoRounds,
+                  contextLimitK = contextLimitK)
     }
 
     val chatsFlow: Flow<Map<String, Chat>> = context.dataStore.data.map { prefs ->
@@ -272,8 +349,9 @@ class AppRepository(private val context: Context) {
             prefs[Keys.messageFontSize] = config.messageFontSize
             prefs[Keys.themeMode] = config.themeMode
             prefs[Keys.accentColor] = config.accentColor
-            prefs[Keys.superChat] = config.superChat
             prefs[Keys.toolApprovalThreshold] = config.toolApprovalThreshold
+            prefs[Keys.maxAutoRounds] = config.maxAutoRounds
+            prefs[Keys.contextLimitK] = config.contextLimitK
         }
     }
 
@@ -283,9 +361,184 @@ class AppRepository(private val context: Context) {
         }
     }
 
+    // ── 记忆系统（跨会话长期记忆，AI 通过 remember_memory / recall_memories 工具存取） ──
+
+    /** 全部记忆（最新在前） */
+    val memoriesFlow: Flow<List<MemoryEntry>> = context.dataStore.data.map { prefs ->
+        val json = prefs[Keys.memories] ?: "[]"
+        try {
+            val type = object : TypeToken<List<MemoryEntry>>() {}.type
+            gson.fromJson<List<MemoryEntry>>(json, type) ?: emptyList()
+        } catch (_: Exception) { emptyList() }
+    }
+
+    private suspend fun saveMemories(list: List<MemoryEntry>) {
+        context.dataStore.edit { prefs -> prefs[Keys.memories] = gson.toJson(list) }
+    }
+
+    suspend fun addMemory(content: String, importance: String = "normal"): MemoryEntry {
+        val now = System.currentTimeMillis()
+        val entry = MemoryEntry(
+            id = "mem_${System.currentTimeMillis()}_${(Math.random() * 100000).toInt()}",
+            content = content.trim(),
+            importance = if (importance in setOf("low", "normal", "high")) importance else "normal",
+            createdAt = now, updatedAt = now
+        )
+        val list = memoriesFlow.first().toMutableList()
+        list.add(0, entry)
+        if (list.size > 200) list.removeAt(list.size - 1)   // 上限防膨胀
+        saveMemories(list)
+        return entry
+    }
+
+    suspend fun deleteMemory(id: String) {
+        saveMemories(memoriesFlow.first().filterNot { it.id == id })
+    }
+
+    suspend fun clearMemories() = saveMemories(emptyList())
+
+    override suspend fun saveMemory(content: String, importance: String): String {
+        if (content.isBlank()) return "错误：内容为空"
+        val entry = addMemory(content, importance)
+        return "已保存记忆（${entry.importance}）：${entry.content.take(80)}"
+    }
+
+    override suspend fun recallMemories(query: String): String {
+        val all = memoriesFlow.first()
+        val q = query.trim()
+        val hits = if (q.isBlank()) all.take(10)
+        else {
+            val words = q.split(Regex("\\s+|，|,|。|；")).filter { it.length >= 2 }
+            all.filter { m ->
+                val c = m.content.lowercase()
+                c.contains(q.lowercase()) || words.any { c.contains(it.lowercase()) }
+            }.take(10)
+        }
+        if (hits.isEmpty()) return "（没有找到相关记忆，可调用 remember_memory 保存）"
+        return hits.joinToString("\n") { "- [${it.importance}] ${it.content}" }
+    }
+
+    /** 注入 system 的记忆文本；无记忆时返回空串 */
+    suspend fun formatMemoryNotes(): String {
+        val all = memoriesFlow.first()
+        if (all.isEmpty()) return ""
+        return buildString {
+            append("以下是关于用户的长久记忆（跨会话有效，请参考这些信息来回答，但不要复述本条说明）：\n")
+            all.take(20).forEach { append("- ").append(it.content).append('\n') }
+        }
+    }
+
+    // ── 联网搜索（参考 modsearch：Firecrawl keyless 为主，Keenable keyless 降级） ──
+
+    private data class SearchItem(val title: String, val url: String, val snippet: String)
+
+    override suspend fun webSearch(query: String, maxResults: Int): String = withContext(Dispatchers.IO) {
+        val limit = maxResults.coerceIn(1, 8)
+        val items = try {
+            firecrawlSearch(query, limit)
+        } catch (e1: Exception) {
+            try { keenableSearch(query, limit) }
+            catch (_: Exception) { throw Exception("联网搜索失败：${e1.message}") }
+        }
+        if (items.isEmpty()) return@withContext "（未找到相关结果，可尝试换个关键词）"
+        buildString {
+            append("搜索结果（").append(items.size).append(" 条，按相关度排序）：\n")
+            items.forEachIndexed { i, it ->
+                append(i + 1).append(". ").append(it.title).append('\n')
+                append("   链接：").append(it.url).append('\n')
+                if (it.snippet.isNotBlank()) append("   摘要：").append(it.snippet).append('\n')
+            }
+        }
+    }
+
+    override suspend fun fetchPage(url: String): String = withContext(Dispatchers.IO) {
+        val body = mapOf(
+            "url" to url,
+            "formats" to listOf("markdown"),
+            "onlyMainContent" to true,
+            "maxAge" to 0,
+            "storeInCache" to false,
+            "skipTlsVerification" to false,
+            "timeout" to 20000
+        )
+        val text = httpPost("https://api.firecrawl.dev/v2/scrape", body, timeoutMs = 30_000)
+        val data = gson.fromJson(text, Map::class.java)
+        val d = (data["data"] as? Map<*, *>) ?: throw Exception("抓取失败：响应格式异常")
+        val markdown = (d["markdown"] as? String) ?: ""
+        val meta = (d["metadata"] as? Map<*, *>) ?: emptyMap<String, Any?>()
+        val title = (meta["title"] as? String)?.takeIf { it.isNotBlank() } ?: url
+        val content = markdown.trim().take(8000)
+        if (content.isBlank()) return@withContext "（页面无可读正文：$url）"
+        buildString {
+            append("标题：").append(title).append('\n')
+            append("页面正文：\n").append(content)
+        }
+    }
+
+    /** Firecrawl keyless /v2/search（无 Authorization，匿名配额按 IP 计） */
+    private suspend fun firecrawlSearch(query: String, limit: Int): List<SearchItem> {
+        val body = mapOf("query" to query, "limit" to limit, "sources" to listOf("web"), "timeout" to 20000)
+        val text = httpPost("https://api.firecrawl.dev/v2/search", body, timeoutMs = 20_000)
+        val data = gson.fromJson(text, Map::class.java)
+        val web = ((data["data"] as? Map<*, *>)?.get("web") as? List<*>) ?: emptyList<Any?>()
+        return web.mapNotNull { r ->
+            val m = r as? Map<*, *> ?: return@mapNotNull null
+            SearchItem(
+                (m["title"] as? String) ?: "",
+                (m["url"] as? String) ?: "",
+                (m["description"] as? String) ?: ""
+            )
+        }.filter { it.url.isNotBlank() }
+    }
+
+    /** Keenable keyless /v1/search/public（x-keenable-title 标识来源） */
+    private suspend fun keenableSearch(query: String, limit: Int): List<SearchItem> {
+        val body = mapOf("query" to query, "max_results" to limit)
+        val text = httpPost(
+            "https://api.keenable.ai/v1/search/public", body, timeoutMs = 20_000,
+            headers = mapOf("x-keenable-title" to "uchat")
+        )
+        val data = gson.fromJson(text, Map::class.java)
+        val results = (data["results"] as? List<*>) ?: emptyList<Any?>()
+        return results.mapNotNull { r ->
+            val m = r as? Map<*, *> ?: return@mapNotNull null
+            SearchItem(
+                (m["title"] as? String) ?: "",
+                (m["url"] as? String) ?: "",
+                ((m["snippet"] as? String) ?: (m["description"] as? String)) ?: ""
+            )
+        }.filter { it.url.isNotBlank() }
+    }
+
+    /** 通用 JSON POST（复用 openConnection 的内置证书信任） */
+    private suspend fun httpPost(
+        url: String,
+        body: Map<String, Any?>,
+        timeoutMs: Int,
+        headers: Map<String, String> = emptyMap()
+    ): String = withContext(Dispatchers.IO) {
+        val conn = openConnection(URL(url)).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            headers.forEach { (k, v) -> setRequestProperty(k, v) }
+            doOutput = true; doInput = true
+            connectTimeout = timeoutMs; readTimeout = timeoutMs
+        }
+        try {
+            conn.outputStream.use { it.write(gson.toJson(body).toByteArray(StandardCharsets.UTF_8)); it.flush() }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val err = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $code"
+                throw Exception("HTTP $code: ${err.take(160)}")
+            }
+            conn.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     /** 统一的连接入口：HTTPS 连接注入内置证书信任的 SocketFactory */
-    private fun openConnection(url: URL): HttpURLConnection {
-        val conn = url.openConnection() as HttpURLConnection
+    private fun openConnection(url: URL): HttpURLConnection {        val conn = url.openConnection() as HttpURLConnection
         if (url.protocol == "https" && conn is HttpsURLConnection) {
             sslSocketFactory?.let { conn.sslSocketFactory = it }
         }
@@ -294,10 +547,9 @@ class AppRepository(private val context: Context) {
 
     /**
      * 发送消息（OpenAI 兼容 /chat/completions）。
+     * API 地址只需填到 v1 根地址（如 https://api.deepseek.com/v1），自动拼接 /chat/completions。
      * @param onChunk 流式增量回调（累计全文正文 + 思考过程）；非流式时仅回调一次
      * @param isCancelled 外部取消标志；content 为 null 表示请求被取消
-     * @param sessionSeed 会话种子：Our Free Model 免费车道按 session 计配额，
-     *        同一对话固定使用同一 session id 以避免 429
      */
     suspend fun sendMessage(
         config: AppConfig,
@@ -305,9 +557,12 @@ class AppRepository(private val context: Context) {
         newMessage: String,
         onChunk: (content: String, reasoning: String) -> Unit,
         isCancelled: () -> Boolean = { false },
-        sessionSeed: String? = null,
         attachments: List<SendAttachment> = emptyList(),
-        tools: List<ToolDef> = emptyList()
+        tools: List<ToolDef> = emptyList(),
+        /** 注入 system 的长期记忆文本（formatMemoryNotes() 产出），空则跳过 */
+        memoryNotes: String = "",
+        /** 追加到 system 末尾的临时指令（如 AI 续写指令），不写入对话历史 */
+        extraSystem: String? = null
     ): SendResult = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         val model = config.models.find { it.id == config.activeModelId }
@@ -317,10 +572,13 @@ class AppRepository(private val context: Context) {
 
         val msgList = mutableListOf<Map<String, Any?>>()
         val agentPrompt = if (tools.isNotEmpty()) agentSystemPrompt(tools) else null
-        val systemPrompt = when {
-            agentPrompt != null && model.systemPrompt.isNotBlank() -> model.systemPrompt + "\n\n" + agentPrompt
-            agentPrompt != null -> agentPrompt
-            else -> model.systemPrompt
+        // 回复协议：JSON 输出（content + done）默认对全部模型启用，解析失败客户端自动降级
+        val systemPrompt = buildString {
+            append(JSON_PROTOCOL_PROMPT)
+            if (memoryNotes.isNotBlank()) append("\n\n").append(memoryNotes)
+            if (model.systemPrompt.isNotBlank()) append("\n\n").append(model.systemPrompt)
+            if (agentPrompt != null) append("\n\n").append(agentPrompt)
+            if (extraSystem != null) append("\n\n").append(extraSystem)
         }
         if (systemPrompt.isNotBlank()) {
             msgList.add(mapOf("role" to "system", "content" to systemPrompt))
@@ -368,8 +626,8 @@ class AppRepository(private val context: Context) {
             msgList.add(mapOf("role" to "user", "content" to parts))
         }
 
-        // Our Free Model 免费车道只允许流式
-        val streaming = if (model.freeGatewayFingerprint) true else model.stream
+        // 流式 / 非流式由配置决定
+        val streaming = model.stream
 
         val body = mutableMapOf<String, Any?>(
             "model" to model.model,
@@ -377,7 +635,7 @@ class AppRepository(private val context: Context) {
             "temperature" to model.temperature
         )
         if (streaming) body["stream"] = true
-        if (tools.isNotEmpty() && !model.freeGatewayFingerprint) {
+        if (tools.isNotEmpty()) {
             body["tools"] = tools.map { def ->
                 mapOf(
                     "type" to "function",
@@ -390,30 +648,18 @@ class AppRepository(private val context: Context) {
             }
             body["tool_choice"] = "auto"
         }
-        if (model.freeGatewayFingerprint) {
-            // 免费车道：工具指纹声明（网关要求四件套，否则 403 FreeTierError）+ 思考等级预算
-            body["tools"] = OpenCodeGateway.fingerprintTools()
-            body["tool_choice"] = "none"
-            OpenCodeEffort.budgetFor(model.thinkingLevel, model.model)?.let { body["max_tokens"] = it }
-        } else if (model.thinking) {
+        if (model.thinking) {
             body["thinking"] = true
         }
 
         val requestBody = gson.toJson(body)
-        val conn = openConnection(URL(model.apiUrl)).apply {
+        val conn = openConnection(URL(chatCompletionsEndpoint(model.apiUrl))).apply {
             requestMethod = "POST"
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Authorization", "Bearer ${model.apiKey}")
             if (streaming) setRequestProperty("Accept", "text/event-stream")
             // 自定义请求头
             model.customHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
-            // 免费网关指纹头
-            if (model.freeGatewayFingerprint) {
-                OpenCodeGateway.fingerprintHeaders(
-                    sessionId = OpenCodeGateway.sessionId(sessionSeed ?: "chat"),
-                    requestId = null
-                ).forEach { (k, v) -> setRequestProperty(k, v) }
-            }
             doOutput = true; doInput = true
             connectTimeout = 20_000; readTimeout = 60_000
         }
@@ -436,6 +682,49 @@ class AppRepository(private val context: Context) {
             } else {
                 SendResult(content, reasoning, System.currentTimeMillis() - startTime, toolCalls)
             }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /**
+     * 上下文摘要：把历史对话文本用当前模型压缩成中文要点摘要（非流式、无工具、无 JSON 协议）。
+     * 失败抛异常，由调用方回退窗口截断。
+     */
+    suspend fun summarize(historyText: String, config: AppConfig): String = withContext(Dispatchers.IO) {
+        val model = config.models.find { it.id == config.activeModelId }
+            ?: throw Exception("未选择模型，无法压缩上下文")
+        if (model.apiKey.isBlank() || model.model.isBlank()) throw Exception("模型配置不完整，无法压缩上下文")
+        val body = mapOf(
+            "model" to model.model,
+            "stream" to false,
+            "messages" to listOf(
+                mapOf("role" to "system", "content" to SUMMARY_PROMPT),
+                mapOf("role" to "user", "content" to historyText)
+            ),
+            "max_tokens" to 1024,
+            "temperature" to 0.3
+        )
+        val requestBody = gson.toJson(body)
+        val conn = openConnection(URL(chatCompletionsEndpoint(model.apiUrl))).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", "Bearer ${model.apiKey}")
+            model.customHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
+            doOutput = true; doInput = true
+            connectTimeout = 20_000; readTimeout = 60_000
+        }
+        try {
+            conn.outputStream.use { it.write(requestBody.toByteArray(StandardCharsets.UTF_8)); it.flush() }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val err = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $code"
+                throw Exception("API 错误 ($code): ${err.take(200)}")
+            }
+            val text = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).readText()
+            val j = gson.fromJson(text, Map::class.java) as? Map<*, *>
+            val content = (((j?.get("choices") as? List<*>)?.getOrNull(0) as? Map<*, *>)?.get("message") as? Map<*, *>)?.get("content") as? String
+            content?.trim()?.takeIf { it.isNotBlank() } ?: throw Exception("摘要返回为空")
         } finally {
             conn.disconnect()
         }
@@ -518,8 +807,64 @@ class AppRepository(private val context: Context) {
         return Triple(clean, if (reasoning.isNotBlank()) reasoning else tagged, calls)
     }
 
-    /** Agent 模式系统提示词：说明工具与自主决策规则，确保模型使用工具 */
-    private fun agentSystemPrompt(tools: List<ToolDef>): String = buildString {
+    /** 对话 JSON 协议提示词：要求模型以 JSON 回复，done 字段控制是否自主续写（加固版：面向大多数模型） */
+    private val JSON_PROTOCOL_PROMPT = buildString {
+        append("回复格式协议（务必严格遵守）：\n")
+        append("1. 你的每一条回复正文都必须是一个 JSON 对象，形如 {\"content\":\"正文内容\",\"done\":true}。\n")
+        append("2. 只允许输出这一个 JSON 对象，前后不要有任何其它文字、解释、注释，也不要用 ``` 代码块或任何标记包裹它。\n")
+        append("3. JSON 只有两个字段：\n")
+        append("   - content：你要对用户说的话，可以是多行文本，支持 Markdown；\n")
+        append("   - done：只能是布尔值 true 或 false（不要写成字符串 \"true\"/\"false\"，也不要省略）。\n")
+        append("4. done 的含义：true = 已经完整回答完毕，本回合结束；false = 还没说完（例如还要补充细节、继续推进多步任务、想再追问澄清、把回答分多段给出），系统会自动让你接着输出下一段，直到输出 done=true 为止。\n")
+        append("5. 示例：\n")
+        append("   回答完毕：{\"content\":\"你好！我是你的 AI 助手。\",\"done\":true}\n")
+        append("   还没说完：{\"content\":\"这个问题分三步。第一步……\",\"done\":false}\n")
+        append("6. 简单问题一次答完即可，直接 done=true，不要为了多说话故意拆成多段。\n")
+        append("7. 特别注意：content 里写你要说的话本身，不要写\"这是一个JSON\"之类的描述；不要在 content 里重复协议规则。")
+    }
+
+    /**
+     * 解析模型回复的 JSON 协议（content + done）。
+     * 兼容：整体 JSON、```json 围栏包裹、前后夹带说明文字（取首尾大括号间子串）。
+     * 解析失败时降级为普通文本（content=原文，done=true），保证不兼容协议的模型也能正常聊天。
+     */
+    fun parseJsonReply(text: String): JsonReply {
+        val t = text.trim()
+        parseJsonObject(t)?.let { return it }
+        // 去掉 ```json ... ``` 围栏
+        val fence = Regex("(?s)```[a-zA-Z]*\\s*(\\{[\\s\\S]*?\\})\\s*```").find(t)
+        if (fence != null) {
+            parseJsonObject(fence.groupValues[1].trim())?.let { return it }
+        }
+        // 取首个 { 到末尾 } 的子串
+        val first = t.indexOf('{')
+        val last = t.lastIndexOf('}')
+        if (first >= 0 && last > first) {
+            parseJsonObject(t.substring(first, last + 1))?.let { return it }
+        }
+        return JsonReply(t, true)
+    }
+
+    /** 上下文摘要提示词：要求模型把历史对话压缩成要点 */
+    private val SUMMARY_PROMPT = buildString {
+        append("你是一个对话摘要器。把下面这段对话压缩成简洁的中文要点摘要，按要点分行输出，不超过 300 字。\n")
+        append("必须保留：用户身份/偏好/重要事实/已做决定/关键结论/未完成事项/约定。\n")
+        append("不要虚构、不要复述对话原文、不要输出寒暄。只输出摘要正文。")
+    }
+
+    private fun parseJsonObject(s: String): JsonReply? = try {
+        val obj = gson.fromJson(s, Map::class.java) as? Map<*, *> ?: return null
+        val content = (obj["content"] as? String)?.takeIf { it.isNotBlank() } ?: return null
+        // done 兼容布尔与字符串两种写法（弱模型可能输出 "done": "false"）
+        val done = when (val d = obj["done"]) {
+            is Boolean -> d
+            is String -> d.equals("true", ignoreCase = true)
+            else -> true
+        }
+        JsonReply(content, done)
+    } catch (_: Exception) { null }
+
+    /** Agent 模式系统提示词：说明工具与自主决策规则，确保模型使用工具 */    private fun agentSystemPrompt(tools: List<ToolDef>): String = buildString {
         append("你当前处于 Agent 模式，可使用以下工具：\n")
         tools.forEach { t ->
             append("- 工具名 ").append(t.name).append("：").append(t.description)
@@ -532,6 +877,7 @@ class AppRepository(private val context: Context) {
         append("4. 输出最终回答后立即结束回合，不要无意义地反复调用工具\n")
         append("5. 若工具返回错误，可修正参数重试一次；仍失败则如实告知用户\n")
         append("6. 全程使用简体中文回答\n")
+        append("7. 回复支持 Markdown：展示图片用 ![描述](图片URL)，提供网页/文件下载链接用 [文字](https://…)，可放正文任意位置；网络图片可直接引用 URL\n")
     }
 
     /**
@@ -571,14 +917,25 @@ class AppRepository(private val context: Context) {
         return s.trim()
     }
 
-    /** 由任意形式的 API 地址推导 /v1/models 端点 */
+    /** 由任意形式的 API 地址推导 /v1/models 端点（兼容完整端点与 v1 根地址） */
     private fun modelsEndpoint(apiUrl: String): String {
-        val base = apiUrl
-            .substringBefore("/v1/chat/completions")
-            .substringBefore("/chat/completions")
-            .substringBefore("/v1/models")
-            .trimEnd('/')
-        return "$base/v1/models"
+        val t = apiUrl.trim()
+        val base = when {
+            t.endsWith("/chat/completions") -> t.removeSuffix("/chat/completions")
+            t.endsWith("/models") -> t.removeSuffix("/models").trimEnd('/')
+            else -> t.trimEnd('/')
+        }.trimEnd('/')
+        return if (base.endsWith("/v1")) "$base/models" else "$base/v1/models"
+    }
+
+    /** 由 API 地址推导 chat completions 端点：完整端点原样使用，v1 根地址自动拼接 */
+    private fun chatCompletionsEndpoint(apiUrl: String): String {
+        val t = apiUrl.trim()
+        return when {
+            t.endsWith("/chat/completions") -> t
+            t.endsWith("/models") -> t.removeSuffix("/models") + "chat/completions"
+            else -> t.trimEnd('/') + "/chat/completions"
+        }
     }
 
     /** 拉取可用模型列表（使用传入的模型配置，而非已保存的配置） */
@@ -615,13 +972,7 @@ class AppRepository(private val context: Context) {
                 when {
                     code in 200..299 -> ApiTestResult(true, "连接成功 (HTTP $code)")
                     code == 401 -> ApiTestResult(false, "认证失败：API Key 无效 (401)")
-                    code == 403 -> ApiTestResult(
-                        false,
-                        if (model.freeGatewayFingerprint)
-                            "访问被拒 (403)：免费通道可能地区受限或暂不可用，可重试或换模型"
-                        else
-                            "权限不足 (403)"
-                    )
+                    code == 403 -> ApiTestResult(false, "权限不足 (403)")
                     else -> ApiTestResult(false, "服务器返回错误 (HTTP $code)")
                 }
             } finally { conn.disconnect() }
@@ -634,109 +985,9 @@ class AppRepository(private val context: Context) {
         }
     }
 
-    /** 附加自定义请求头与免费网关指纹头（GET 类请求） */
+    /** 附加自定义请求头（GET 类请求） */
     private fun applyExtraHeaders(conn: HttpURLConnection, model: ModelConfig) {
         model.customHeaders.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-        if (model.freeGatewayFingerprint) {
-            OpenCodeGateway.fingerprintHeaders(sessionId = null, requestId = null)
-                .forEach { (k, v) -> conn.setRequestProperty(k, v) }
-        }
-    }
-
-    // ── Our Free Model：免费模型清单 + 实测速度 ─────────────────
-
-    /** 拉取 OpenCode 网关免费模型清单（带指纹头），附本地能力表信息 */
-    suspend fun fetchOpenCodeFreeModels(): List<OpenCodeFreeModel> = withContext(Dispatchers.IO) {
-        try {
-            val conn = openConnection(URL(OpenCodeGateway.MODELS_URL)).apply {
-                setRequestProperty("Authorization", "Bearer public")
-                OpenCodeGateway.fingerprintHeaders(sessionId = null, requestId = null)
-                    .forEach { (k, v) -> setRequestProperty(k, v) }
-                connectTimeout = 15_000; readTimeout = 15_000
-            }
-            return@withContext try {
-                if (conn.responseCode == 200) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val resp = gson.fromJson(body, Map::class.java)
-                    val ids = (resp["data"] as? List<*>)?.mapNotNull { (it as? Map<*, *>)?.get("id") as? String } ?: emptyList()
-                    OpenCodeCatalog.buildFromIds(ids)
-                } else emptyList()
-            } finally { conn.disconnect() }
-        } catch (_: Exception) { emptyList() }
-    }
-
-    /** 实测单个免费模型的首字延迟与可用性（最小流式请求，使用独立测速 session） */
-    suspend fun testOpenCodeModelSpeed(model: OpenCodeFreeModel): OpenCodeSpeedResult = withContext(Dispatchers.IO) {
-        if (!model.chatWire) return@withContext OpenCodeSpeedResult(false, -1, "走 /responses 接口，暂不支持")
-        val startTime = System.currentTimeMillis()
-        try {
-            val body = mapOf(
-                "model" to model.id,
-                "messages" to listOf(mapOf("role" to "user", "content" to "hi")),
-                "stream" to true,
-                "max_tokens" to 8,
-                "tools" to OpenCodeGateway.fingerprintTools(),
-                "tool_choice" to "none"
-            )
-            val requestBody = gson.toJson(body)
-            val conn = openConnection(URL(OpenCodeGateway.CHAT_URL)).apply {
-                requestMethod = "POST"
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Authorization", "Bearer public")
-                setRequestProperty("Accept", "text/event-stream")
-                OpenCodeGateway.fingerprintHeaders(
-                    sessionId = OpenCodeGateway.sessionId("probe-${model.id}"),
-                    requestId = null
-                ).forEach { (k, v) -> setRequestProperty(k, v) }
-                doOutput = true; doInput = true
-                connectTimeout = 10_000; readTimeout = 60_000
-            }
-            return@withContext try {
-                conn.outputStream.use { it.write(requestBody.toByteArray(StandardCharsets.UTF_8)); it.flush() }
-                val code = conn.responseCode
-                when {
-                    code !in 200..299 -> {
-                        val errText = conn.errorStream?.bufferedReader()?.readText().orEmpty()
-                        when {
-                            code == 403 || errText.contains("RegionError") -> OpenCodeSpeedResult(false, -1, "地区受限")
-                            code == 429 || errText.contains("FreeUsageLimitError") -> OpenCodeSpeedResult(false, -1, "免费额度限制")
-                            else -> OpenCodeSpeedResult(false, -1, "HTTP $code")
-                        }
-                    }
-                    else -> {
-                        val reader = BufferedReader(InputStreamReader(conn.inputStream, StandardCharsets.UTF_8))
-                        var ttft = -1L
-                        try {
-                            var line = reader.readLine()
-                            while (line != null) {
-                                val trimmed = line.trim()
-                                if (trimmed.startsWith("data:")) {
-                                    val data = trimmed.removePrefix("data:").trim()
-                                    if (data == "[DONE]") break
-                                    try {
-                                        val parsed = gson.fromJson(data, Map::class.java)
-                                        val delta = (((parsed["choices"] as? List<*>)?.getOrNull(0) as? Map<*, *>)?.get("delta") as? Map<*, *>) ?: emptyMap<String, Any?>()
-                                        if (!(delta["content"] as? String).isNullOrBlank() || !(delta["reasoning"] as? String).isNullOrBlank()) {
-                                            ttft = System.currentTimeMillis() - startTime
-                                            break
-                                        }
-                                    } catch (_: Exception) {}
-                                }
-                                line = reader.readLine()
-                            }
-                        } finally {
-                            try { reader.close() } catch (_: Exception) {}
-                        }
-                        if (ttft > 0) OpenCodeSpeedResult(true, ttft, "首字 ${ttft}ms")
-                        else OpenCodeSpeedResult(true, -1, "无输出")
-                    }
-                }
-            } finally { conn.disconnect() }
-        } catch (e: java.net.SocketTimeoutException) {
-            OpenCodeSpeedResult(false, -1, "连接超时")
-        } catch (e: Exception) {
-            OpenCodeSpeedResult(false, -1, "连接失败")
-        }
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -776,76 +1027,6 @@ class AppRepository(private val context: Context) {
     }
 }
 
-/**
- * Our Free Model 免费车道（opencode.ai 免密网关）协议封装。
- *
- * 网关要点（均经 2026-09-25 实测验证）：
- * - 公共凭据 `Authorization: Bearer public`，无真实密钥；
- * - 请求必须带 `opencode/1.18.31` UA 与 `x-opencode-*` 指纹头，否则 Cloudflare 403；
- * - 免费档只允许流式（stream=true）；
- * - 请求体必须声明 bash/glob/grep/read 四个工具，否则 403 FreeTierError；
- * - 按 session id 计配额（429），同一对话应复用同一 session id。
- */
-object OpenCodeGateway {
-
-    /** chat 完成端点 */
-    const val CHAT_URL = "https://opencode.ai/zen/v1/chat/completions"
-
-    /** 模型清单端点 */
-    const val MODELS_URL = "https://opencode.ai/zen/v1/models"
-
-    /** 网关要求的 UA：需包含 opencode/ 且版本 >= 1.17 */
-    private const val CLIENT_UA = "deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness) opencode/1.18.31"
-
-    private const val BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-    private val FINGERPRINT_TOOLS = listOf("bash", "glob", "grep", "read")
-
-    private fun sha256(input: String): ByteArray =
-        MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
-
-    private fun base62(bytes: ByteArray): String = buildString {
-        for (b in bytes) append(BASE62[(b.toInt() and 0xFF) % 62])
-    }
-
-    /** 由种子派生稳定的网关会话 id（同一对话固定，避免触发 429） */
-    fun sessionId(seed: String): String {
-        val digest = sha256("our-free-model\u0000$seed")
-        val hex = digest.take(6).joinToString("") { "%02x".format(it) }
-        val tail = if (digest.size > 20) digest.copyOfRange(6, 20) else digest.copyOfRange(6, digest.size)
-        return "ses_$hex${base62(tail)}"
-    }
-
-    /** 每次请求的 request id */
-    fun requestId(): String {
-        val digest = sha256(System.nanoTime().toString())
-        val hex = digest.take(6).joinToString("") { "%02x".format(it) }
-        return "msg_$hex${base62(digest.copyOfRange(6, 20))}"
-    }
-
-    /** 网关指纹请求头 */
-    fun fingerprintHeaders(sessionId: String?, requestId: String?): Map<String, String> = mapOf(
-        "user-agent" to CLIENT_UA,
-        "x-opencode-client" to "desktop",
-        "x-opencode-session" to (sessionId ?: sessionId("global")),
-        "x-opencode-request" to (requestId ?: requestId()),
-        "x-opencode-project" to "global"
-    )
-
-    /** 免费档要求的工具指纹声明（占位工具，不可用） */
-    fun fingerprintTools(): List<Map<String, Any>> =
-        FINGERPRINT_TOOLS.map { name ->
-            mapOf(
-                "type" to "function",
-                "function" to mapOf(
-                    "name" to name,
-                    "description" to "This tool is currently unavailable and must not be used.",
-                    "parameters" to mapOf("type" to "object", "properties" to emptyMap<String, Any>())
-                )
-            )
-        }
-}
-
 data class ApiTestResult(val success: Boolean, val message: String)
 
 /** 发送结果：content 为 null 表示被取消 */
@@ -857,23 +1038,10 @@ data class SendResult(
     val toolCalls: List<ToolCallData> = emptyList()
 )
 
-/** OpenCode 免费车道模型条目（能力来自本地能力表，网关接口只返回 id） */
-data class OpenCodeFreeModel(
-    val id: String,
-    val name: String,
-    val reasoning: Boolean,
-    val vision: Boolean,
-    val contextWindow: Int,
-    val maxOutput: Int,
-    val canDisableThinking: Boolean,
-    val chatWire: Boolean
-)
-
-/** 免费模型测速结果：latencyMs>0 表示首字延迟（毫秒） */
-data class OpenCodeSpeedResult(
-    val ok: Boolean,
-    val latencyMs: Long,
-    val note: String
+/** 对话 JSON 协议解析结果：content 为过滤后的正文，done=false 表示 AI 要求继续续写 */
+data class JsonReply(
+    val content: String,
+    val done: Boolean
 )
 
 /** 发送附件：kind=image（content 为 base64，走多模态 content 数组）| kind=text（文本文件内容直接拼入正文） */
@@ -885,152 +1053,75 @@ data class SendAttachment(
     val size: Long = 0L
 )
 
-/** 模型能力快照（编辑表单/思考等级展示用） */
-data class ModelCapabilities(
-    val reasoning: Boolean,
-    val maxOutput: Int,
-    val canDisableThinking: Boolean
+/** 粗略 token 估算：中文/CJK 按 1 token/字，其余按 4 字符/token（用于上下文压缩阈值判定） */
+fun estimateTokens(vararg parts: String): Int {
+    var tokens = 0
+    for (s in parts) {
+        var cjk = 0
+        var rest = 0
+        for (ch in s) {
+            if (ch.code >= 0x2E80) cjk++ else rest++
+        }
+        tokens += cjk + rest / 4
+    }
+    return tokens
+}
+
+/** 把历史消息扁平化为可摘要的纯文本（含摘要标记与工具结果简述） */
+fun flattenHistoryForSummary(msgs: List<ChatMessage>): String {
+    val sb = StringBuilder()
+    for (m in msgs) {
+        when (m.role) {
+            "system" -> sb.append("已压缩摘要: ").append(m.content).append('\n')
+            "tool" -> sb.append("工具 ").append(m.toolName ?: "").append(" 返回: ").append(m.content.take(200)).append('\n')
+            "user" -> sb.append("用户: ").append(m.content).append('\n')
+            else -> sb.append("AI: ").append(m.content).append('\n')
+        }
+    }
+    return sb.toString()
+}
+
+/** markdown 资源块：kind=image（![alt](url)）| kind=file（[name](文件 url)）；cleanOffset 为该语法在干净文本中的起始位置（用于原位置渲染） */
+data class MdBlock(
+    val kind: String,
+    val text: String,
+    val url: String,
+    val cleanOffset: Int
 )
 
 /**
- * OpenCode 免费车道模型能力表（移植自 dsh-our-free-model 插件 catalog.js）。
- * 网关 /zen/v1/models 只返回 id，没有能力字段，故按模型 id 匹配本地能力表。
+ * 从 markdown 正文提取图片与文件链接块。
+ * 返回 (干净文本, 块列表)：资源语法从正文中移除（文件链接不再保留名字文本），
+ * 块按出现顺序排列，cleanOffset 指向该资源在干净文本中的插入位置，UI 据此原地渲染。
  */
-object OpenCodeCatalog {
-
-    private data class Cap(
-        val pattern: Regex,
-        val vision: Boolean,
-        val reasoning: Boolean,
-        val contextWindow: Int,
-        val maxOutput: Int,
-        val canDisableThinking: Boolean? = null
+fun extractMarkdownBlocks(content: String): Pair<String, List<MdBlock>> {
+    val pattern = Regex(
+        """!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(((?:https?|file)://[^)\s]*\.(?:pdf|zip|apk|exe|docx?|xlsx?|pptx?|tar|gz|7z|bin|iso|mp3|mp4|wav|rar|dmg|msi|deb|rpm|log|csv|json|xml|sql)(?:\?[^)\s]*)?)\)"""
     )
-
-    private val CAPABILITIES = listOf(
-        Cap(Regex("^mimo.*v2\\.6"), true, true, 1048576, 131072, false),
-        Cap(Regex("^mimo.*v2\\.5"), true, true, 1048576, 131072, false),
-        Cap(Regex("^mimo"), true, true, 262144, 131072, null),
-        Cap(Regex("^muse.?spark"), true, true, 1048576, 131072, null),
-        Cap(Regex("^nemotron"), false, true, 128000, 32768, null),
-        Cap(Regex("^ling"), false, true, 128000, 32768, null),
-        Cap(Regex("^space.?bunny"), true, true, 262144, 65536, null),
-        Cap(Regex("^union"), true, false, 262144, 131072, null),
-        Cap(Regex("^deepseek"), false, true, 128000, 64000, null),
-        Cap(Regex("^jev"), false, false, 32768, 4096, null)
-    )
-
-    private val DISPLAY_NAMES = mapOf(
-        "mimo-v2.6-flash-free" to "MiMo V2.6 Flash",
-        "mimo-v2.5-free" to "MiMo V2.5",
-        "muse-spark-1.3-contributor-free" to "Muse Spark 1.3",
-        "muse-spark-1.2-contributor-free" to "Muse Spark 1.2",
-        "nemotron-3-ultra-free" to "Nemotron 3 Ultra",
-        "nemotron-3.5-lightning-free" to "Nemotron 3.5 Lightning",
-        "ling-3.0-flash-fin-free" to "Ling 3.0 Flash Fin",
-        "space-bunny-free" to "Space Bunny",
-        "union-alpha" to "Union Alpha",
-        "deepseek-v4-flash-free" to "DeepSeek V4 Flash",
-        "jev-1.13-free" to "Jev 1.13"
-    )
-
-    private val ALWAYS_FREE = setOf("union-alpha", "space-bunny-free")
-
-    /** 走 /responses 接口（app 暂不支持）的模型 */
-    private val RESPONSES_MODELS = setOf("muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free")
-
-    /** 是否免费车道模型（id 后缀带 free，或白名单） */
-    fun isFreeLane(id: String): Boolean {
-        if (id in ALWAYS_FREE) return true
-        return Regex("(?:^|[-_])free(?:$|[-_.])").containsMatchIn(id)
-    }
-
-    fun isResponsesWire(id: String): Boolean = id in RESPONSES_MODELS
-
-    /** 能力表查询，未命中时回退默认（reasoning、32K） */
-    fun capabilitiesOf(id: String): ModelCapabilities {
-        for (cap in CAPABILITIES) if (cap.pattern.matches(id)) {
-            return ModelCapabilities(
-                reasoning = cap.reasoning,
-                maxOutput = cap.maxOutput,
-                canDisableThinking = cap.canDisableThinking ?: true
-            )
+    val blocks = mutableListOf<MdBlock>()
+    val sb = StringBuilder(content.length)
+    var deleted = 0
+    var last = 0
+    for (m in pattern.findAll(content)) {
+        sb.append(content, last, m.range.first)
+        val cleanOffset = m.range.first - deleted
+        val isImage = m.value.startsWith("!")
+        if (isImage) {
+            val alt = m.groupValues[1].trim()
+            val url = m.groupValues[2].trim()
+            if (url.startsWith("http") || url.startsWith("data:image") || url.startsWith("file:")) {
+                blocks.add(MdBlock("image", alt.ifBlank { "图片" }, url, cleanOffset))
+                deleted += m.value.length
+            } else {
+                sb.append(m.value) // 不支持的图片语法保留原文
+            }
+        } else {
+            blocks.add(MdBlock("file", m.groupValues[3], m.groupValues[4], cleanOffset))
+            deleted += m.value.length
         }
-        return ModelCapabilities(reasoning = true, maxOutput = 32768, canDisableThinking = true)
+        last = m.range.last + 1
     }
-
-    /** 展示名：优先已知映射，否则把 id 转标题大小写 */
-    fun displayName(id: String): String {
-        DISPLAY_NAMES[id]?.let { return it }
-        val words = id.replace(Regex("[-_.]+"), " ").trim().split(" ")
-        return words.joinToString(" ") { word ->
-            if (word.isEmpty()) word
-            else if (word[0].isDigit()) word
-            else word.replaceFirstChar { it.uppercase() }
-        }
-    }
-
-    /** 由网关返回的 id 列表构建能力增强的免费模型清单（按清单顺序，去重） */
-    fun buildFromIds(ids: List<String>): List<OpenCodeFreeModel> {
-        val seen = mutableSetOf<String>()
-        val result = mutableListOf<OpenCodeFreeModel>()
-        for (raw in ids) {
-            val id = raw.trim()
-            if (id.isEmpty() || !isFreeLane(id) || id in seen) continue
-            seen.add(id)
-            val cap = CAPABILITIES.firstOrNull { it.pattern.matches(id) }
-            val caps = capabilitiesOf(id)
-            result.add(
-                OpenCodeFreeModel(
-                    id = id,
-                    name = displayName(id),
-                    reasoning = caps.reasoning,
-                    vision = cap?.vision ?: false,
-                    contextWindow = cap?.contextWindow ?: 131072,
-                    maxOutput = caps.maxOutput,
-                    canDisableThinking = caps.canDisableThinking,
-                    chatWire = !isResponsesWire(id)
-                )
-            )
-        }
-        return result
-    }
+    sb.append(content, last, content.length)
+    return Pair(sb.toString(), blocks)
 }
 
-/**
- * 思考等级 → 输出预算（移植自插件 effort.js）：
- * 精简 2048 / 均衡 8192 / 深思 = 模型上限；思考不可关闭的模型（MiMo V2.5/2.6）各档翻倍，
- * 因为思考与正文共用同一份预算。
- */
-object OpenCodeEffort {
-
-    const val MIN_BUDGET = 512
-
-    val LEVELS = listOf("light", "balanced", "deep")
-
-    /** 返回该等级应下发网关的 max_tokens；off 或模型不支持思考返回 null（不限制） */
-    fun budgetFor(level: String, modelId: String): Int? {
-        if (level == "off") return null
-        val ceiling = when (level) {
-            "light" -> 2048
-            "balanced" -> 8192
-            "deep" -> null // 模型上限
-            else -> return null
-        }
-        val caps = OpenCodeCatalog.capabilitiesOf(modelId)
-        if (!caps.reasoning) return null
-        val capacity = caps.maxOutput
-        val c = when {
-            ceiling == null -> capacity
-            caps.canDisableThinking == false -> ceiling * 2
-            else -> ceiling
-        }
-        return maxOf(MIN_BUDGET, minOf(c, capacity))
-    }
-
-    /** 展示用预算文本，如 "2K" / "128K" / "不限制" */
-    fun budgetLabel(level: String, modelId: String): String {
-        val budget = budgetFor(level, modelId) ?: return "不限制"
-        return if (budget >= 1024) "${budget / 1024}K" else "$budget"
-    }
-}

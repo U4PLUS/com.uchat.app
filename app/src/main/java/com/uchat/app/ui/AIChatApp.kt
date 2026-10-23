@@ -2,16 +2,23 @@
 
 package com.uchat.app.ui
 
+import android.app.DownloadManager
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Environment
 import android.provider.OpenableColumns
+import android.util.Base64
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -22,6 +29,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -43,7 +51,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalContext
@@ -51,6 +62,10 @@ import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.AnnotatedString
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLDecoder
+import javax.net.ssl.HttpsURLConnection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -63,16 +78,21 @@ import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.uchat.app.data.ChatMessage
 import com.uchat.app.data.CodeBlock
+import com.uchat.app.data.MemoryEntry
 import com.uchat.app.data.ModelConfig
-import com.uchat.app.data.OpenCodeFreeModel
-import com.uchat.app.data.OpenCodeSpeedResult
 import com.uchat.app.data.SendAttachment
+import com.uchat.app.data.TlsConfig
 import com.uchat.app.data.ToolCallData
+import com.uchat.app.data.extractMarkdownBlocks
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.uchat.app.data.parseMarkdown
 import com.uchat.app.data.parseMarkdownSegments
 import com.uchat.app.viewmodel.ChatUiState
 import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private val LightColors = lightColorScheme(
     primary = Color(0xFF1A73E8),
@@ -571,9 +591,6 @@ fun ChatScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.clickable { showModelMenu = true }.padding(horizontal = 6.dp, vertical = 4.dp)
                         ) {
-                            if (uiState.config.superChat) {
-                                Text("⚡", fontSize = 13.sp, modifier = Modifier.padding(end = 2.dp))
-                            }
                             Text(
                                 activeModel,
                                 fontSize = 15.sp,
@@ -614,29 +631,6 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    // Super Chat 开关（免费车道不支持 → 提示）
-                    var showSuperToolTip by remember { mutableStateOf(false) }
-                    Box {
-                        IconButton(onClick = {
-                            val isFree = uiState.config.models.find { it.id == uiState.config.activeModelId }?.freeGatewayFingerprint == true
-                            if (isFree) showSuperToolTip = true
-                            else onIntent(UiIntent.ToggleSuperChat)
-                        }) {
-                            Icon(
-                                Icons.Default.Bolt,
-                                contentDescription = "Super Chat",
-                                tint = if (uiState.config.superChat) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        if (showSuperToolTip) {
-                            AlertDialog(
-                                onDismissRequest = { showSuperToolTip = false },
-                                title = { Text("无法开启 Super Chat") },
-                                text = { Text("当前使用的是免费车道模型（强制 tool_choice=none），不支持工具调用。请更换为支持 function calling 的模型后再使用 Agent 模式。") },
-                                confirmButton = { TextButton(onClick = { showSuperToolTip = false }) { Text("知道了") } }
-                            )
-                        }
-                    }
                     // Regenerate
                     if (uiState.messages.isNotEmpty() && !uiState.isLoading) {
                         IconButton(onClick = { onIntent(UiIntent.Regenerate) }) {
@@ -711,6 +705,8 @@ fun ChatScreen(
                 }
             }
 
+            // 按"工作回合"分组：assistant(含工具调用) 与跟随的 tool 结果合并为一张工作卡片（DSH 风格）
+            val msgGroups = remember(uiState.messages) { buildMsgGroups(uiState.messages) }
             LazyColumn(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 state = listState,
@@ -728,7 +724,7 @@ fun ChatScreen(
                                 if (uiState.config.models.isEmpty()) {
                                     Text("还没有可用模型", color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), fontSize = 14.sp)
                                     Spacer(modifier = Modifier.height(4.dp))
-                                    Text("点右上角 ⋮ → 设置 → 获取免费模型，或手动添加", color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f), fontSize = 12.sp)
+                                    Text("点右上角 ⋮ → 设置 → 添加模型", color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f), fontSize = 12.sp)
                                 } else {
                                     Text("输入消息，发送后自动开始新对话", color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), fontSize = 13.5.sp)
                                 }
@@ -737,17 +733,28 @@ fun ChatScreen(
                     }
                 }
 
-                items(uiState.messages, key = { it.id }) { msg ->
-                    if (msg.role == "tool") {
-                        ToolResultCard(msg)
-                    } else {
-                        MessageBubble(
-                            msg = msg,
-                            isDark = uiState.config.themeMode != "light",
-                            fontSp = uiState.config.messageFontSize.sp,
-                            toolCalls = msg.toolCalls ?: emptyList(),
-                            onLongClick = { showMenuMsg = msg }
+                items(msgGroups, key = { it.key }) { g ->
+                    val callMsg = g.callMsg
+                    val plain = g.msg
+                    when {
+                        callMsg != null -> ToolWorkCard(
+                            callMsg = callMsg,
+                            results = g.results,
+                            isDark = uiState.config.darkMode,
+                            fontSp = uiState.config.messageFontSize.sp
                         )
+                        plain?.role == "tool" -> ToolResultCard(plain)
+                        plain?.role == "system" -> SummaryBlock(plain)
+                        plain != null -> MessageBubble(
+                            msg = plain,
+                            isDark = uiState.config.darkMode,
+                            fontSp = uiState.config.messageFontSize.sp,
+                            onLongClick = { showMenuMsg = plain }
+                        )
+                    }
+                    // send_file 文件卡片：独立显示在消息末尾（AI 正文之后；无正文时在工具卡片之后）
+                    g.files.forEach { (fName, fUrl) ->
+                        FileCard(name = fName, url = fUrl)
                     }
                 }
 
@@ -788,6 +795,42 @@ fun ChatScreen(
                     }
                 }
 
+                // 自动重试中（网络/5xx）：显示错误消息与重试进度
+                if (uiState.retryInfo != null) {
+                    item(key = "retryInfo") {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Warning,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(15.dp),
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "请求失败：${uiState.retryInfo.message.take(80)}",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                    Text(
+                                        "5 秒后自动重试（第 ${uiState.retryInfo.attempt}/${uiState.retryInfo.maxAttempts} 次）",
+                                        fontSize = 10.5.sp,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 流式输出中的实时气泡（打字机效果）
                 if (uiState.streamingContent != null) {
                     item(key = "streaming") {
@@ -800,6 +843,18 @@ fun ChatScreen(
                                 onStop = { onIntent(UiIntent.StopGenerating) }
                             )
                         }
+                    }
+                }
+
+                // AI 自主续写中（JSON 协议 done=false，AI 要求继续说）
+                if (uiState.autoContinuing) {
+                    item(key = "autoContinuing") {
+                        Text(
+                            "AI 还没说完，继续回复中…",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 2.dp, bottom = 4.dp)
+                        )
                     }
                 }
 
@@ -927,8 +982,7 @@ private fun MessageBubble(
     msg: ChatMessage,
     isDark: Boolean,
     fontSp: TextUnit,
-    onLongClick: () -> Unit,
-    toolCalls: List<ToolCallData> = emptyList()
+    onLongClick: () -> Unit
 ) {
     val isUser = msg.role == "user"
     val bubbleColor = if (isUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
@@ -973,29 +1027,165 @@ private fun MessageBubble(
                         color = textColor.copy(alpha = 0.5f)
                     )
                 }
-                // Agent 模式：工具调用记录（可展开）
-                if (toolCalls.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    for (call in toolCalls) {
-                        var expanded by remember { mutableStateOf(false) }
-                        Surface(
-                            modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
-                            shape = RoundedCornerShape(8.dp),
-                            color = if (isUser) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.5f)
-                        ) {
-                            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text("🔧 ${call.name}", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = textColor)
-                                    Spacer(modifier = Modifier.weight(1f))
-                                    Text(if (expanded) "收起" else "参数", fontSize = 10.sp, color = textColor.copy(alpha = 0.6f))
-                                }
-                                if (expanded && call.arguments.isNotBlank()) {
-                                    Spacer(modifier = Modifier.height(3.dp))
-                                    Text(call.arguments, fontSize = 10.5.sp, color = textColor.copy(alpha = 0.8f), maxLines = 6, overflow = TextOverflow.Ellipsis)
-                                }
+            }
+        }
+    }
+}
+
+/** 渲染分组：一个"工作回合" = assistant(含工具调用) + 跟随的工具结果；其余为独立消息 */
+private data class ToolGroup(
+    val key: Any,
+    val callMsg: ChatMessage? = null,
+    val results: List<ChatMessage> = emptyList(),
+    val msg: ChatMessage? = null,
+    val files: List<Pair<String, String>> = emptyList()
+)
+
+/** 把消息流按工作回合分组：带工具调用的 assistant 消息吸收其后紧跟的 role=tool 结果消息；send_file 的文件卡片挂到该回合 AI 正文之后 */
+private fun buildMsgGroups(messages: List<ChatMessage>): List<ToolGroup> {
+    val out = mutableListOf<ToolGroup>()
+    var pendingCall: ChatMessage? = null
+    val pendingResults = mutableListOf<ChatMessage>()
+    val pendingFiles = mutableListOf<Pair<String, String>>()
+    fun flush() {
+        val c = pendingCall
+        if (c != null) {
+            // 无 AI 正文的回合：文件卡片挂在工具卡片之后（回合末尾）
+            out.add(ToolGroup(key = c.id, callMsg = c, results = pendingResults.toList(), files = pendingFiles.toList()))
+            pendingCall = null
+            pendingResults.clear()
+            pendingFiles.clear()
+        }
+    }
+    for (m in messages) {
+        when {
+            m.role == "assistant" && !m.toolCalls.isNullOrEmpty() -> { flush(); pendingCall = m }
+            m.role == "tool" && pendingCall != null -> {
+                pendingResults.add(m)
+                parseFileCard(m.content)?.let { pendingFiles.add(it) }
+            }
+            m.role == "assistant" && m.toolCalls.isNullOrEmpty() && pendingCall != null -> {
+                // AI 正文：先结算工具回合（卡片移出），文件卡片挂在正文末尾
+                val c = pendingCall
+                if (c != null) {
+                    out.add(ToolGroup(key = c.id, callMsg = c, results = pendingResults.toList()))
+                    out.add(ToolGroup(key = m.id, msg = m, files = pendingFiles.toList()))
+                } else {
+                    out.add(ToolGroup(key = m.id, msg = m, files = pendingFiles.toList()))
+                }
+                pendingCall = null
+                pendingResults.clear()
+                pendingFiles.clear()
+            }
+            else -> { flush(); out.add(ToolGroup(key = m.id, msg = m)) }
+        }
+    }
+    flush()
+    return out
+}
+
+/**
+ * 工具工作卡片（DSH 风格）：默认收起只显示"调用工具 + 工具名"；
+ * 展开后依次展示每个工具的调用参数（AI 工作信息），下方紧跟该工具的返回结果。
+ * AI 给用户的最终报告是卡片之后的正常气泡。
+ */
+@Composable
+private fun ToolWorkCard(
+    callMsg: ChatMessage,
+    results: List<ChatMessage>,
+    isDark: Boolean,
+    fontSp: TextUnit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val calls = callMsg.toolCalls.orEmpty()
+    val resultById = results.associateBy { it.toolCallId }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp).clickable { expanded = !expanded },
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Build,
+                    contentDescription = null,
+                    modifier = Modifier.size(13.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    "调用工具",
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    if (expanded) "收起" else "展开",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+            }
+            Spacer(modifier = Modifier.height(3.dp))
+            if (!expanded) {
+                Text(
+                    calls.joinToString("、") { it.name },
+                    fontSize = 10.5.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            } else {
+                calls.forEachIndexed { index, call ->
+                    val res = resultById[call.id] ?: results.getOrNull(index)
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            "${index + 1}. ${call.name}",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (call.arguments.isNotBlank()) {
+                            Text(
+                                call.arguments,
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
+                                maxLines = 8,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        if (res != null) {
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                "返回",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                            )
+                            val fc = parseFileCard(res.content)
+                            if (fc != null) {
+                                // 文件卡片不显示在工具返回里，已移至消息末尾独立展示
+                                Text(
+                                    "已发送文件：${fc.first}",
+                                    fontSize = 10.5.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else {
+                                Text(
+                                    res.content.ifBlank { "(无输出)" },
+                                    fontSize = 10.5.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
-                        Spacer(modifier = Modifier.height(3.dp))
+                        if (index != calls.lastIndex) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Box(
+                                modifier = Modifier.fillMaxWidth().height(1.dp)
+                                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                     }
                 }
             }
@@ -1032,13 +1222,151 @@ private fun ToolResultCard(msg: ChatMessage) {
                 Text(if (expanded) "收起" else "展开", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
             Spacer(modifier = Modifier.height(3.dp))
-            Text(
-                preview,
-                fontSize = 10.5.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = if (expanded) 12 else 2,
-                overflow = TextOverflow.Ellipsis
-            )
+            val fc = parseFileCard(msg.content)
+            if (fc != null) {
+                FileCard(name = fc.first, url = fc.second)
+            } else {
+                Text(
+                    preview,
+                    fontSize = 10.5.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = if (expanded) 12 else 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+/** 解析 send_file 工具结果协议：「【文件卡片】文件名|url」→ (name, url)；非文件卡片返回 null */
+private fun parseFileCard(content: String): Pair<String, String>? {
+    if (!content.startsWith("【文件卡片】")) return null
+    val rest = content.removePrefix("【文件卡片】").trim()
+    val sep = rest.indexOf('|')
+    if (sep <= 0) return null
+    val name = rest.substring(0, sep).trim()
+    val url = rest.substring(sep + 1).trim()
+    if (name.isBlank() || url.isBlank()) return null
+    return name to url
+}
+
+/** 文件卡片：横 4:1 比例，左侧 1:1 文件类型图标 + 名称，点击提示并下载（系统下载器，通知栏显示进度） */
+@Composable
+private fun FileCard(name: String, url: String) {
+    val context = LocalContext.current
+    val (iconColor, iconLabel) = fileTypeInfo(name)
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp).clip(RoundedCornerShape(12.dp)).clickable {
+            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+            if (dm == null) {
+                Toast.makeText(context, "系统下载器不可用", Toast.LENGTH_SHORT).show()
+            } else {
+                try {
+                    val safe = name.replace(Regex("""[\\/:*?"<>|\s]"""), "_").ifBlank { "file" }
+                    val req = DownloadManager.Request(Uri.parse(url))
+                        .setTitle(name)
+                        .setDescription("正在下载到「下载」目录…")
+                        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safe)
+                    dm.enqueue(req)
+                    Toast.makeText(context, "开始下载：$name", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "下载失败：${e.message ?: "无法启动下载"}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        },
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().aspectRatio(4f).padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // 左侧 1:1 文件类型图标
+            Box(
+                modifier = Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)).background(iconColor),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    iconLabel,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            // 名称与下载提示
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    name,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    "点击下载",
+                    fontSize = 10.5.sp,
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                )
+            }
+        }
+    }
+}
+
+/** 按扩展名返回文件类型图标的 (背景色, 缩写标签) */
+private fun fileTypeInfo(name: String): Pair<Color, String> {
+    val ext = name.substringAfterLast('.', "").lowercase().trim()
+    return when (ext) {
+        "pdf" -> Color(0xFFE53935) to "PDF"
+        "zip", "rar", "7z", "tar", "gz", "tgz" -> Color(0xFFFB8C00) to "ZIP"
+        "apk" -> Color(0xFF43A047) to "APK"
+        "doc", "docx" -> Color(0xFF1E88E5) to "DOC"
+        "xls", "xlsx", "csv" -> Color(0xFF2E7D32) to "XLS"
+        "ppt", "pptx" -> Color(0xFFD84315) to "PPT"
+        "png", "jpg", "jpeg", "gif", "webp", "bmp" -> Color(0xFF8E24AA) to "IMG"
+        "mp3", "mp4", "wav", "flac", "aac", "ogg" -> Color(0xFF00897B) to "MED"
+        "txt", "log", "md", "json", "xml", "sql", "yml", "yaml" -> Color(0xFF546E7A) to "TXT"
+        "exe", "msi", "dmg", "deb", "rpm" -> Color(0xFF5E35B1) to "APP"
+        else -> Color(0xFF455A64) to ext.uppercase().take(3).ifBlank { "FILE" }
+    }
+}
+
+/** 早期对话摘要块（上下文压缩产物，role=system 的【早期对话摘要】消息）：默认收起，展开显示摘要全文 */
+@Composable
+private fun SummaryBlock(msg: ChatMessage) {
+    var expanded by remember { mutableStateOf(false) }
+    val preview = msg.content.removePrefix("【早期对话摘要】").ifBlank { msg.content }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp).clickable { expanded = !expanded },
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Info,
+                    contentDescription = null,
+                    modifier = Modifier.size(13.dp),
+                    tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    "早期对话摘要（已压缩）",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(if (expanded) "收起" else "展开", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
+            }
+            if (expanded) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(preview, fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
@@ -1152,17 +1480,65 @@ fun MarkdownContent(
     onCopied: () -> Unit,
     fontSize: TextUnit = 14.sp
 ) {
-    val segments = remember(content, isDark) { parseMarkdownSegments(content, isDark) }
+    // 先提取 markdown 资源块（图片 / 文件链接），干净文本按资源在原 markdown 中的位置交错渲染
+    val (cleanText, blocks) = remember(content) { extractMarkdownBlocks(content) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        var last = 0
+        blocks.forEach { b ->
+            if (b.cleanOffset > last) {
+                MarkdownTextSection(
+                    text = cleanText.substring(last, b.cleanOffset),
+                    isDark = isDark,
+                    textColor = textColor,
+                    onCopied = onCopied,
+                    fontSize = fontSize
+                )
+                last = b.cleanOffset
+            }
+            when (b.kind) {
+                "image" -> MdImageBlock(url = b.url, alt = b.text, isDark = isDark)
+                "file" -> FileLinkRow(name = b.text, url = b.url)
+            }
+        }
+        if (last < cleanText.length) {
+            MarkdownTextSection(
+                text = cleanText.substring(last),
+                isDark = isDark,
+                textColor = textColor,
+                onCopied = onCopied,
+                fontSize = fontSize
+            )
+        }
+    }
+}
+
+/** 渲染一段干净 markdown 文本：段落 + 行内链接（可点击）+ 代码块 */
+@Composable
+private fun MarkdownTextSection(
+    text: String,
+    isDark: Boolean,
+    textColor: Color,
+    onCopied: () -> Unit,
+    fontSize: TextUnit
+) {
+    if (text.isBlank()) return
+    val segments = remember(text, isDark) { parseMarkdownSegments(text, isDark) }
     val clipboardManager = LocalClipboardManager.current
+    val uriHandler = LocalUriHandler.current
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         segments.plainSegments.forEachIndexed { plainIdx, (annotated, _) ->
-            // Check if there's a code block immediately after this plain text
-            // plainIdx maps to code block at same index (codeBlocks list aligns with interleaving)
-            Text(
+            val segLinks = segments.links.getOrNull(plainIdx).orEmpty()
+            // ClickableText：点击命中段内链接位置时打开浏览器，其余位置无动作
+            ClickableText(
                 text = annotated,
-                fontSize = fontSize,
-                color = textColor
+                style = TextStyle(fontSize = fontSize, color = textColor),
+                onClick = { offset ->
+                    segLinks.firstOrNull { offset in it.start until it.end }?.let { lp ->
+                        runCatching { uriHandler.openUri(lp.url) }
+                    }
+                }
             )
             // Render any code block that follows this plain segment
             if (plainIdx < segments.codeBlocks.size) {
@@ -1179,6 +1555,153 @@ fun MarkdownContent(
             }
         }
     }
+}
+
+/** markdown 图片块：加载并显示 ![alt](url)（支持 http(s) / data:base64 / file://），点击查看大图 */
+@Composable
+private fun MdImageBlock(url: String, alt: String, isDark: Boolean) {
+    val context = LocalContext.current
+    var state by remember(url) { mutableStateOf<ImgUiState>(ImgUiState.Loading) }
+    LaunchedEffect(url) {
+        state = ImgUiState.Loading
+        state = withContext(Dispatchers.IO) {
+            val bmp = loadMarkdownImage(context, url)
+            if (bmp != null) ImgUiState.Ready(bmp) else ImgUiState.Failed
+        }
+    }
+    when (val s = state) {
+        is ImgUiState.Loading -> Box(
+            modifier = Modifier.fillMaxWidth().height(150.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+        }
+        is ImgUiState.Failed -> Surface(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)),
+            shape = RoundedCornerShape(8.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Error, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.error)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("图片加载失败${if (alt.isNotBlank() && alt != "图片") "：$alt" else ""}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (url.startsWith("http")) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    val uriHandler = LocalUriHandler.current
+                    Text(
+                        "打开原图",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        textDecoration = TextDecoration.Underline,
+                        modifier = Modifier.clickable { runCatching { uriHandler.openUri(url) } }
+                    )
+                }
+            }
+        }
+        is ImgUiState.Ready -> {
+            var zoom by remember { mutableStateOf(false) }
+            Image(
+                bitmap = s.bitmap.asImageBitmap(),
+                contentDescription = alt,
+                contentScale = ContentScale.FillWidth,
+                modifier = Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { zoom = true }
+            )
+            if (zoom) ImageViewerDialog(bitmap = s.bitmap, alt = alt) { zoom = false }
+        }
+    }
+}
+
+private sealed interface ImgUiState {
+    data object Loading : ImgUiState
+    data class Ready(val bitmap: Bitmap) : ImgUiState
+    data object Failed : ImgUiState
+}
+
+/** 大图查看对话框：点击任意处关闭 */
+@Composable
+private fun ImageViewerDialog(bitmap: Bitmap, alt: String, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        Box(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color.Black).clickable { onDismiss() },
+            contentAlignment = Alignment.Center
+        ) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = alt,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxWidth().padding(8.dp)
+            )
+        }
+    }
+}
+
+/** markdown 文件链接块：[name](file.ext) → 可点击文件行（浏览器/系统打开） */
+@Composable
+private fun FileLinkRow(name: String, url: String) {
+    val uriHandler = LocalUriHandler.current
+    Surface(
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { runCatching { uriHandler.openUri(url) } },
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                name,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text("打开", fontSize = 10.5.sp, color = MaterialTheme.colorScheme.primary, textDecoration = TextDecoration.Underline)
+        }
+    }
+}
+
+/** 加载 markdown 图片字节：data:base64 直接解码；file:// 读本地；http(s) 复用内置证书信任下载 */
+private fun loadMarkdownImage(context: Context, url: String): Bitmap? {
+    val bytes: ByteArray = when {
+        url.startsWith("data:image") -> try {
+            Base64.decode(url.substringAfter(','), Base64.DEFAULT)
+        } catch (_: Exception) { return null }
+        url.startsWith("file://") -> try {
+            File(URLDecoder.decode(url.removePrefix("file://"), "UTF-8")).readBytes()
+        } catch (_: Exception) { return null }
+        url.startsWith("http") -> try {
+            val conn = URL(url).openConnection() as? HttpURLConnection ?: return null
+            if (conn is HttpsURLConnection) {
+                TlsConfig.createSocketFactory(context)?.let { conn.sslSocketFactory = it }
+            }
+            conn.connectTimeout = 15_000
+            conn.readTimeout = 30_000
+            conn.instanceFollowRedirects = true
+            conn.requestMethod = "GET"
+            if (conn.responseCode !in 200..299) { conn.disconnect(); return null }
+            conn.inputStream.use { it.readBytes() }.also { conn.disconnect() }
+        } catch (_: Exception) { return null }
+        else -> return null
+    }
+    return try {
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+        var sample = 1
+        while (o.outWidth / sample > 2048 || o.outHeight / sample > 2048) sample *= 2
+        val o2 = BitmapFactory.Options().apply { inSampleSize = sample }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o2)
+    } catch (_: Exception) { null }
 }
 
 @Composable
@@ -1340,7 +1863,8 @@ fun SettingsScreen(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
                     when {
                         uiState.editingModel != null -> "编辑模型"
                         section == "models" -> "模型"
-                        section == "superchat" -> "Super Chat"
+                        section == "agent" -> "Agent 工具"
+                        section == "memories" -> "记忆"
                         section == "appearance" -> "外观"
                         section == "data" -> "数据"
                         section == "about" -> "关于"
@@ -1393,9 +1917,15 @@ private fun SettingsHomeList(uiState: ChatUiState, onIntent: (UiIntent) -> Unit,
         )
         SettingsRow(
             icon = Icons.Default.Bolt,
-            title = "Super Chat（Agent 模式）",
-            subtitle = if (uiState.config.superChat) "已开启 · 授权阈值 ${thresholdLabel(uiState.config.toolApprovalThreshold)}" else "未开启（模型可自主调用工具）",
-            onClick = { onOpen("superchat") }
+            title = "Agent 工具",
+            subtitle = "常开 · 授权阈值 ${thresholdLabel(uiState.config.toolApprovalThreshold)} · 续写上限 ${if (uiState.config.maxAutoRounds == 0) "不限" else "${uiState.config.maxAutoRounds} 轮"}",
+            onClick = { onOpen("agent") }
+        )
+        SettingsRow(
+            icon = Icons.Default.Favorite,
+            title = "记忆",
+            subtitle = "AI 跨会话记住你 · 共 ${uiState.memories.size} 条",
+            onClick = { onOpen("memories"); onIntent(UiIntent.LoadMemories) }
         )
         SettingsRow(
             icon = Icons.Default.Palette,
@@ -1429,7 +1959,8 @@ private fun SettingsHomeList(uiState: ChatUiState, onIntent: (UiIntent) -> Unit,
 private fun SettingsSectionBody(section: String?, uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
     when (section) {
         "models" -> ModelsTabContent(uiState, onIntent)
-        "superchat" -> SuperChatTabContent(uiState, onIntent)
+        "agent" -> AgentTabContent(uiState, onIntent)
+        "memories" -> MemoriesTabContent(uiState, onIntent)
         "appearance" -> AppearanceTabContent(uiState, onIntent)
         "data" -> DataTabContent(uiState, onIntent)
         "crashlog" -> CrashLogTabContent()
@@ -1473,30 +2004,167 @@ private fun thresholdLabel(level: Int): String = when (level) {
     else -> "仅高风险确认"
 }
 
-/** Super Chat（Agent 模式）设置子页：开关 + 授权阈值 + 可用工具 */
+/** 记忆设置子页：查看 / 删除 AI 跨会话保存的长期记忆 */
 @Composable
-private fun SuperChatTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
+private fun MemoriesTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
+    LaunchedEffect(Unit) { onIntent(UiIntent.LoadMemories) }
     Column(modifier = Modifier.fillMaxWidth()) {
         Surface(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
             shape = RoundedCornerShape(12.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Text(
+                "AI 会在对话中自动判断并保存关于你的重要信息（偏好 / 身份 / 习惯 / 事实），跨会话有效，并随每轮对话注入给 AI。你可以在这里查看、删除或清空。",
+                fontSize = 11.5.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(14.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        if (uiState.memories.isEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Icon(Icons.Default.Bolt, null, modifier = Modifier.size(20.dp), tint = if (uiState.config.superChat) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(modifier = Modifier.width(12.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Super Chat（Agent 模式）", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                    Spacer(modifier = Modifier.height(3.dp))
-                    Text(
-                        "开启后模型自主决策：先调用工具、查看结果、再继续推进，直到完成任务后结束回合。不适用于 free 免费车道模型（其接口强制 tool_choice=none）。",
-                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                Text(
+                    "还没有记忆。告诉 AI 一些你的偏好或信息（例如「记住，我喜欢简洁的回答」），它会自动保存到这里的。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(14.dp)
+                )
+            }
+        } else {
+            uiState.memories.forEach { m ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).padding(vertical = 3.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(modifier = Modifier.padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 4.dp)) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    when (m.importance) {
+                                        "high" -> "高"
+                                        "low" -> "低"
+                                        else -> "普通"
+                                    },
+                                    fontSize = 10.5.sp,
+                                    color = when (m.importance) {
+                                        "high" -> MaterialTheme.colorScheme.error
+                                        "low" -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        else -> MaterialTheme.colorScheme.primary
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(m.updatedAt)),
+                                    fontSize = 10.5.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(m.content, fontSize = 13.sp)
+                        }
+                        IconButton(onClick = { onIntent(UiIntent.DeleteMemory(m.id)) }) {
+                            Icon(Icons.Default.Delete, contentDescription = "删除这条记忆", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+                        }
+                    }
                 }
-                Switch(checked = uiState.config.superChat, onCheckedChange = { onIntent(UiIntent.ToggleSuperChat) })
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            Button(
+                onClick = { onIntent(UiIntent.ClearMemories) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer)
+            ) { Text("清空全部记忆") }
+        }
+    }
+}
+
+/** Agent 工具设置子页：AI 自主续写轮数 + 授权阈值 + 可用工具 */
+@Composable
+private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("AI 自主续写轮数", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "回复走 JSON 协议（content + done）。AI 说还没说完（done=false）时，客户端自动请求其继续输出，像真人一样连说多段，直到 done=true 结束。0 = 不限（有失控风险）。",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                SingleLineRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(
+                        0 to "不限",
+                        3 to "3 轮",
+                        5 to "5 轮",
+                        10 to "10 轮",
+                        20 to "20 轮"
+                    ).forEach { (rounds, label) ->
+                        FilterChip(
+                            selected = uiState.config.maxAutoRounds == rounds,
+                            onClick = { onIntent(UiIntent.SetMaxAutoRounds(rounds)) },
+                            label = { Text(label, fontSize = 12.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Surface(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("上下文压缩阈值", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "历史消息估算超过该值时，最旧部分会用 AI 摘要压缩成要点（摘要失败自动回退丢弃旧消息），避免超出模型上下文。0 = 关闭。",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                SingleLineRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(
+                        0 to "关闭",
+                        32 to "32k",
+                        64 to "64k",
+                        128 to "128k",
+                        256 to "256k"
+                    ).forEach { (k, label) ->
+                        FilterChip(
+                            selected = uiState.config.contextLimitK == k,
+                            onClick = { onIntent(UiIntent.SetContextLimitK(k)) },
+                            label = { Text(label, fontSize = 12.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        )
+                    }
+                }
             }
         }
 
@@ -1548,7 +2216,11 @@ private fun SuperChatTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Un
                 listOf(
                     "calculator" to "数学表达式计算（含函数与常量）",
                     "current_time" to "当前日期与时间",
-                    "run_shell" to "内置 busybox 沙箱：白名单命令，可联网(wget)（4 ABI 全兼容）"
+                    "run_shell" to "内置 busybox 沙箱：白名单命令，可联网(wget)（4 ABI 全兼容）",
+                    "web_search" to "联网搜索互联网（Firecrawl 免费额度，无需 API Key，失败自动降级 Keenable）",
+                    "fetch_page" to "抓取公开网页正文（Markdown 截断，用于阅读搜索结果）",
+                    "remember_memory" to "把关于用户的重要信息保存进长期记忆（跨会话有效）",
+                    "recall_memories" to "检索长期记忆中关于用户的已知信息"
                 ).forEach { (name, desc) ->
                     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                         Text("🔧 $name", fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
@@ -1614,96 +2286,6 @@ private fun accentLabel(color: String): String = when (color) {
 @Composable
 private fun ModelsTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        // ── OpenCode 免费模型：获取 → 测速 → 用户自行添加 ──
-        when {
-            uiState.fetchingFreeModels -> {
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        if (uiState.speedTestProgress != null)
-                            "正在实测速度 ${uiState.speedTestProgress}（测完自动隐藏不可用的）..."
-                        else "正在获取免费模型列表...",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
-            }
-            uiState.freeModelError != null -> {
-                Surface(
-                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Text(
-                        uiState.freeModelError,
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-                Spacer(modifier = Modifier.height(6.dp))
-                OutlinedButton(
-                    onClick = { onIntent(UiIntent.FetchOpenCodeModels) },
-                    modifier = Modifier.fillMaxWidth().height(40.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Icon(Icons.Default.Refresh, null, modifier = Modifier.size(15.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("重新获取", fontSize = 13.sp)
-                }
-            }
-            !uiState.freeModelsLoaded -> {
-                OutlinedButton(
-                    onClick = { onIntent(UiIntent.FetchOpenCodeModels) },
-                    modifier = Modifier.fillMaxWidth().height(44.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.primary)
-                ) {
-                    Icon(Icons.Default.Bolt, null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("获取 OpenCode 免费模型", fontSize = 14.sp)
-                }
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    "免登录免 Key 直连 opencode.ai 免费车道。获取后自动筛选带 free 的模型并逐个实测速度，不可用的（地区受限/额度/超时）自动隐藏，仅展示实测可用的，快的排前面；点「添加」才会加入你的模型列表。",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            else -> {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "共 ${uiState.freeModels.size} 个可用免费模型 · 已实测（不可用的已自动隐藏）",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                    TextButton(onClick = { onIntent(UiIntent.FetchOpenCodeModels) }) {
-                        Icon(Icons.Default.Refresh, null, modifier = Modifier.size(14.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("重新获取", fontSize = 12.sp)
-                    }
-                }
-                if (uiState.speedTestProgress != null) {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp))
-                }
-                // 排序：可用且快的在前，失败/不支持在后
-                val sorted = remember(uiState.freeModels, uiState.freeSpeedResults) {
-                    uiState.freeModels.sortedWith { a, b ->
-                        scoreOf(uiState.freeSpeedResults[a.id]).compareTo(scoreOf(uiState.freeSpeedResults[b.id]))
-                    }
-                }
-                sorted.forEach { entry ->
-                    FreeModelRow(entry = entry, uiState = uiState, onIntent = onIntent)
-                }
-            }
-        }
-
         Spacer(modifier = Modifier.height(12.dp))
 
         uiState.config.models.forEach { model ->
@@ -1719,10 +2301,6 @@ private fun ModelsTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit)
                     Column(modifier = Modifier.weight(1f)) {
                         Text(model.name.ifBlank { "未命名" }, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                         Text(model.model.ifBlank { "未设置模型" }, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                    if (model.freeGatewayFingerprint) {
-                        Icon(Icons.Default.Bolt, contentDescription = "免费", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
                     }
                     if (model.id == uiState.config.activeModelId) {
                         Icon(Icons.Default.Check, contentDescription = "当前使用", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
@@ -1743,80 +2321,6 @@ private fun ModelsTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit)
             Spacer(modifier = Modifier.width(6.dp))
             Text("添加模型", fontSize = 14.sp)
         }
-    }
-}
-
-/** 排序键：可用且快的在前 */
-private fun scoreOf(speed: OpenCodeSpeedResult?): Long = when {
-    speed == null -> 3_000_000L
-    !speed.ok -> 2_000_000L
-    speed.latencyMs <= 0 -> 1_000_000L
-    else -> speed.latencyMs
-}
-
-@Composable
-private fun FreeModelRow(entry: OpenCodeFreeModel, uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
-    val speed = uiState.freeSpeedResults[entry.id]
-    val added = uiState.config.models.any { it.model == entry.id }
-    Surface(
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(entry.name, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (entry.reasoning) {
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Surface(shape = RoundedCornerShape(4.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)) {
-                            Text("思考", fontSize = 9.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
-                        }
-                    }
-                    if (!entry.chatWire) {
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Surface(shape = RoundedCornerShape(4.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                            Text("不支持", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
-                        }
-                    }
-                }
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(entry.id, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(
-                    "${entry.contextWindow / 1024}K 上下文" +
-                        (if (entry.reasoning && !entry.canDisableThinking) " · 思考不可关" else "") +
-                        (if (entry.vision) " · 视觉" else ""),
-                    fontSize = 10.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            SpeedBadge(speed)
-            Spacer(modifier = Modifier.width(8.dp))
-            if (added) {
-                Text("已添加", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-            } else {
-                TextButton(onClick = { onIntent(UiIntent.AddOpenCodeModel(entry.id)) }) {
-                    Text("添加", fontSize = 13.sp)
-                }
-            }
-        }
-    }
-    Spacer(modifier = Modifier.height(6.dp))
-}
-
-@Composable
-private fun SpeedBadge(speed: OpenCodeSpeedResult?) {
-    val (color, text) = when {
-        speed == null -> MaterialTheme.colorScheme.onSurfaceVariant to "测速中..."
-        !speed.ok -> MaterialTheme.colorScheme.error to speed.note
-        speed.latencyMs <= 0 -> MaterialTheme.colorScheme.onSurfaceVariant to "无输出"
-        speed.latencyMs < 2000 -> Color(0xFF2E7D32) to "${speed.latencyMs}ms · 快"
-        speed.latencyMs < 6000 -> Color(0xFFEF6C00) to "${speed.latencyMs}ms · 中"
-        else -> Color(0xFFD32F2F) to "${speed.latencyMs}ms · 慢"
-    }
-    Surface(shape = RoundedCornerShape(6.dp), color = color.copy(alpha = 0.12f)) {
-        Text(text, fontSize = 10.sp, color = color, modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp))
     }
 }
 
@@ -2052,7 +2556,7 @@ private fun AboutTabContent() {
                 Text("版本 v$appVersion", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "支持 OpenAI 兼容 API，流式输出（打字机效果），多模型切换，免费模型（免 Key）通道，备份/恢复，本地数据存储。\n内置 ISRG Root X1 证书信任，兼容 Android 5+ 旧设备的 HTTPS 连接。",
+                    "支持 OpenAI 兼容 API，流式输出（打字机效果），多模型切换，Agent 模式（默认常开：模型可自主调用工具、像真人一样连说多轮），备份/恢复，本地数据存储。\n内置 ISRG Root X1 证书信任，兼容 Android 5+ 旧设备的 HTTPS 连接。",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -2099,25 +2603,8 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        // 免费网关提示
-        if (model.freeGatewayFingerprint) {
-            Surface(
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)),
-                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.08f),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Text(
-                    "⚡ 已启用免费模型网关（免 Key）：自动附带 opencode 指纹头与工具声明，免费通道仅支持流式输出；API Key 固定为 public，模型名请在网关返回的清单中选择。",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(10.dp)
-                )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-        }
-
         EditField("配置名称", model.name, { onIntent(UiIntent.UpdateEditingModel(model.copy(name = it))) }, placeholder = "例如：DeepSeek")
-        EditField("API 地址", model.apiUrl, { onIntent(UiIntent.UpdateEditingModel(model.copy(apiUrl = it))) }, placeholder = "https://api.deepseek.com/v1/chat/completions")
+        EditField("API 地址", model.apiUrl, { onIntent(UiIntent.UpdateEditingModel(model.copy(apiUrl = it))) }, placeholder = "https://api.deepseek.com/v1")
         EditField("API Key", model.apiKey, { onIntent(UiIntent.UpdateEditingModel(model.copy(apiKey = it))) }, placeholder = "sk-xxxx...", isPassword = true)
         EditField("模型名称", model.model, { onIntent(UiIntent.UpdateEditingModel(model.copy(model = it))) }, placeholder = "deepseek-chat")
 
@@ -2138,60 +2625,19 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
         Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = model.stream,
-                onCheckedChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(stream = it))) },
-                enabled = !model.freeGatewayFingerprint
+                onCheckedChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(stream = it))) }
             )
-            Text(
-                if (model.freeGatewayFingerprint) "流式输出（免费通道强制开启）" else "流式输出",
-                fontSize = 14.sp
-            )
+            Text("流式输出", fontSize = 14.sp)
         }
 
-        // 思考等级：仅免费网关 + 支持思考的模型
-        val freeCaps = com.uchat.app.data.OpenCodeCatalog.capabilitiesOf(model.model)
-        if (model.freeGatewayFingerprint && freeCaps.reasoning) {
-            Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column {
-                    Text("思考等级", fontSize = 14.sp)
-                    Text(
-                        if (freeCaps.canDisableThinking)
-                            "思考与正文共用输出预算；关闭则不设预算限制"
-                        else
-                            "该模型思考不可关闭，各档预算已自动翻倍",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-            val levels = buildList {
-                if (freeCaps.canDisableThinking) add("off" to "关闭")
-                add("light" to "精简")
-                add("balanced" to "均衡")
-                add("deep" to "深思")
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                levels.forEach { (level, label) ->
-                    val budget = com.uchat.app.data.OpenCodeEffort.budgetLabel(level, model.model)
-                    FilterChip(
-                        selected = model.thinkingLevel == level,
-                        onClick = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinkingLevel = level))) },
-                        label = { Text("$label·$budget", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
-                    )
-                }
-            }
-        } else {
-            Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(
-                    checked = model.thinking,
-                    onCheckedChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinking = it))) }
-                )
-                Column {
-                    Text("深度思考", fontSize = 14.sp)
-                    Text("启用 o1 系列模型的推理能力", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+        Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = model.thinking,
+                onCheckedChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinking = it))) }
+            )
+            Column {
+                Text("深度思考", fontSize = 14.sp)
+                Text("启用 o1 系列模型的推理能力", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
@@ -2415,13 +2861,15 @@ sealed class UiIntent {
     data object ClearExportPayload : UiIntent()
     data class ImportBackup(val json: String) : UiIntent()
     data object ClearAllData : UiIntent()
-    data object FetchOpenCodeModels : UiIntent()
-    data class AddOpenCodeModel(val modelId: String) : UiIntent()
     data class AddAttachment(val attachment: SendAttachment) : UiIntent()
     data class RemoveAttachment(val index: Int) : UiIntent()
     data class SetThemeMode(val mode: String) : UiIntent()
     data class SetAccentColor(val color: String) : UiIntent()
-    data object ToggleSuperChat : UiIntent()
     data class SetApprovalThreshold(val level: Int) : UiIntent()
+    data class SetMaxAutoRounds(val rounds: Int) : UiIntent()
+    data class SetContextLimitK(val k: Int) : UiIntent()
+    data object LoadMemories : UiIntent()
+    data class DeleteMemory(val id: String) : UiIntent()
+    data object ClearMemories : UiIntent()
     data class ApproveTool(val allow: Boolean) : UiIntent()
 }

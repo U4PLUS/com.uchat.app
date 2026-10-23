@@ -10,12 +10,14 @@ import com.uchat.app.data.AppConfig
 import com.uchat.app.data.AppRepository
 import com.uchat.app.data.Chat
 import com.uchat.app.data.ChatMessage
+import com.uchat.app.data.MemoryEntry
 import com.uchat.app.data.ModelConfig
-import com.uchat.app.data.OpenCodeFreeModel
-import com.uchat.app.data.OpenCodeSpeedResult
 import com.uchat.app.data.SendAttachment
+import com.uchat.app.data.SendResult
 import com.uchat.app.data.ToolCallData
 import com.uchat.app.data.ToolDef
+import com.uchat.app.data.estimateTokens
+import com.uchat.app.data.flattenHistoryForSummary
 import com.uchat.app.tools.ToolRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -51,6 +53,8 @@ data class ChatUiState(
     val streamingContent: String? = null,
     /** 流式输出当前累计的思考过程（reasoning），空表示无思考 */
     val streamingReasoning: String? = null,
+    /** AI 自主续写中（JSON 协议 done=false，客户端正请求 AI 继续输出） */
+    val autoContinuing: Boolean = false,
     /** 当前是否有可停止的生成任务 */
     val cancellable: Boolean = false,
     val showSettings: Boolean = false,
@@ -67,24 +71,23 @@ data class ChatUiState(
     val editingTitle: String? = null,
     /** 待写入文件的备份 JSON（由 UI 端 SAF 写入后清除） */
     val exportPayload: String? = null,
-    /** OpenCode 免费模型清单（已从网关拉取并附能力信息） */
-    val freeModels: List<OpenCodeFreeModel> = emptyList(),
-    /** 是否已成功拉取过免费模型清单 */
-    val freeModelsLoaded: Boolean = false,
-    /** 正在拉取免费模型清单 */
-    val fetchingFreeModels: Boolean = false,
-    /** 免费模型测速结果（id -> 结果） */
-    val freeSpeedResults: Map<String, OpenCodeSpeedResult> = emptyMap(),
-    /** 测速进度，如 "3/11" */
-    val speedTestProgress: String? = null,
-    /** 拉取/测速错误提示 */
-    val freeModelError: String? = null,
     /** 待发送附件（图片/文本文件），随下一条消息一起发出后清空 */
     val attachments: List<SendAttachment> = emptyList(),
     /** 进行中的工具调用（Agent 模式） */
     val toolActivity: ToolActivity? = null,
     /** 待用户授权（L3 工具调用） */
     val pendingApproval: PendingToolApproval? = null,
+    /** 长期记忆列表（设置页查看/管理） */
+    val memories: List<MemoryEntry> = emptyList(),
+    /** 自动重试状态：请求失败后间隔重试中（UI 显示错误消息与第几次） */
+    val retryInfo: RetryInfo? = null,
+)
+
+/** 自动重试信息：attempt 为第几次尝试（1 起），maxAttempts 为总次数，message 为错误详情 */
+data class RetryInfo(
+    val attempt: Int,
+    val maxAttempts: Int,
+    val message: String
 )
 
 class ChatViewModel(
@@ -96,6 +99,9 @@ class ChatViewModel(
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
+    /** 续写提示词：模型上一轮 done=false 时追加的 system 消息 */
+    private val CONTINUE_PROMPT = "你上一轮回复中 done 为 false，表示你还没说完。请继续输出剩余内容，仍按回复格式协议输出 JSON。"
+
     /** 生成期间启动前台服务，切换后台/锁屏不中断（顺带为后续代理服务器常驻做准备） */
     /** 当前生成任务 */
     private var generateJob: Job? = null
@@ -103,6 +109,10 @@ class ChatViewModel(
     /** 取消标志：点"停止生成"后置 true，网络层据此中断 */
     @Volatile
     private var cancelled = false
+
+    /** 当前回合是否已因模型不支持工具声明而降级为纯聊天（每次 sendToChat 重置） */
+    @Volatile
+    private var toolDegraded = false
 
     init {
         viewModelScope.launch {
@@ -252,22 +262,143 @@ class ChatViewModel(
         generateJob?.cancel()
         toolApprovalGate?.complete(false)
         toolApprovalGate = null
-        _uiState.update { it.copy(cancellable = false, pendingApproval = null, toolActivity = null) }
+        _uiState.update { it.copy(cancellable = false, pendingApproval = null, toolActivity = null, autoContinuing = false) }
     }
 
-    // ── Super Chat（Agent 模式） ────────────────────────────────
-
-    fun toggleSuperChat() {
-        viewModelScope.launch {
-            val config = _uiState.value.config.copy(superChat = !_uiState.value.config.superChat)
-            repository.saveConfig(config)
-        }
-    }
+    // ── Agent（Super Chat）模式设置 ─────────────────────────────
 
     fun setApprovalThreshold(level: Int) {
         viewModelScope.launch {
             val config = _uiState.value.config.copy(toolApprovalThreshold = level.coerceIn(2, 4))
             repository.saveConfig(config)
+        }
+    }
+
+    fun setMaxAutoRounds(rounds: Int) {
+        viewModelScope.launch {
+            val config = _uiState.value.config.copy(maxAutoRounds = rounds.coerceIn(0, 50))
+            repository.saveConfig(config)
+        }
+    }
+
+    /** 上下文压缩阈值（k token，0 = 关闭），设置项：32/64/128/256 */
+    fun setContextLimitK(k: Int) {
+        viewModelScope.launch {
+            val config = _uiState.value.config.copy(contextLimitK = if (k <= 0) 0 else k.coerceIn(32, 256))
+            repository.saveConfig(config)
+        }
+    }
+
+    // ── 自动重试：网络/5xx 错误最多重试 10 次，每次间隔 5 秒，UI 显示错误消息 ──
+
+    private fun isRetryable(e: Exception): Boolean {
+        if (e is java.io.IOException || e is java.net.SocketTimeoutException) return true
+        val m = e.message ?: ""
+        return m.contains("API 错误 (5") ||
+            m.contains("timeout", ignoreCase = true) ||
+            m.contains("连接", ignoreCase = true) ||
+            m.contains("网络", ignoreCase = true)
+    }
+
+    /** 带自动重试的请求：4xx 先走工具降级（不计次数）；网络/5xx 重试最多 10 次、间隔 5 秒，期间 UI 显示错误 */
+    private suspend fun sendWithRetry(
+        config: AppConfig,
+        messages: List<ChatMessage>,
+        text: String,
+        onChunk: (String, String) -> Unit,
+        attachments: List<SendAttachment>,
+        tools: List<ToolDef>,
+        memoryNotes: String,
+        extraSystem: String?
+    ): SendResult {
+        val MAX_RETRIES = 10
+        val RETRY_DELAY_MS = 5_000L
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                val r = repository.sendMessage(config, messages, text, onChunk, { cancelled }, attachments, tools, memoryNotes, extraSystem)
+                _uiState.update { it.copy(retryInfo = null) }
+                return r
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 工具声明不被模型支持（4xx）→ 去掉工具降级重试一次（普通模型也能正常聊天），不计入网络重试次数
+                if (!toolDegraded && (e.message?.contains("API 错误 (4") == true)) {
+                    toolDegraded = true
+                    _uiState.update { it.copy(retryInfo = null) }
+                    val r = repository.sendMessage(config, messages, text, onChunk, { cancelled }, attachments, emptyList(), memoryNotes, extraSystem)
+                    _uiState.update { it.copy(retryInfo = null) }
+                    return r
+                }
+                if (isRetryable(e) && attempt < MAX_RETRIES) {
+                    _uiState.update { s -> s.copy(retryInfo = RetryInfo(attempt, MAX_RETRIES, e.message ?: "网络错误")) }
+                    delay(RETRY_DELAY_MS)
+                    continue
+                }
+                throw e
+            }
+        }
+    }
+
+    // ── 上下文压缩：超阈值时把最旧部分用 AI 摘要压缩（失败回退窗口截断） ──
+
+    private suspend fun compactIfNeeded(hist: List<ChatMessage>, config: AppConfig): List<ChatMessage> {
+        val limitK = config.contextLimitK
+        if (limitK <= 0 || hist.isEmpty()) return hist
+        // 固定开销：回复协议提示词 + 工具定义 + 记忆注入（粗估）+ 预留输出空间
+        val fixedTokens = 1800
+        val histTokens = estimateTokens(*hist.map { it.content }.toTypedArray())
+        val budget = limitK * 1000L
+        if ((histTokens + fixedTokens).toLong() < budget * 3 / 4) return hist
+        // 需要压缩：保留最近约 45% 预算的完整回合，更早的部分做 AI 摘要
+        val keepTarget = budget * 3 / 4 * 45 / 100
+        var keepTokens = 0L
+        var cutIndex = hist.size
+        for (i in hist.indices.reversed()) {
+            val t = estimateTokens(hist[i].content).toLong()
+            if (keepTokens + t > keepTarget) break
+            keepTokens += t
+            cutIndex = i
+        }
+        // 调整到回合边界：向前跳过 tool 消息与其调用方 assistant(含工具调用)，避免拆散工作回合
+        while (cutIndex > 0) {
+            val prev = hist[cutIndex - 1]
+            if (prev.role == "tool" || !prev.toolCalls.isNullOrEmpty()) cutIndex-- else break
+        }
+        if (cutIndex <= 0) return hist   // 保留部分为空：放弃本次压缩
+        val toSummarize = hist.take(cutIndex)
+        val kept = hist.drop(cutIndex)
+        val summary = try {
+            repository.summarize(flattenHistoryForSummary(toSummarize), config).trim()
+        } catch (_: Exception) {
+            ""   // 摘要失败 → 回退：直接丢弃旧部分（窗口截断兜底）
+        }
+        val head = if (summary.isNotBlank()) {
+            listOf(ChatMessage(role = "system", content = "【早期对话摘要】$summary", reasoning = ""))
+        } else emptyList()
+        return head + kept
+    }
+
+    // ── 记忆系统管理（设置页） ──────────────────────────────────
+
+    fun loadMemories() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(memories = repository.memoriesFlow.first()) }
+        }
+    }
+
+    fun deleteMemory(id: String) {
+        viewModelScope.launch {
+            repository.deleteMemory(id)
+            loadMemories()
+        }
+    }
+
+    fun clearMemories() {
+        viewModelScope.launch {
+            repository.clearMemories()
+            loadMemories()
         }
     }
 
@@ -312,6 +443,7 @@ class ChatViewModel(
         val state = _uiState.value
         val userMsg = ChatMessage(role = "user", content = text)
         cancelled = false
+        toolDegraded = false
         generateJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val allChats = repository.chatsFlow.first().toMutableMap()
@@ -331,18 +463,18 @@ class ChatViewModel(
                 }
                 val startMsgs = allChats[chatId]?.messages?.filter { it.content.isNotBlank() } ?: emptyList()
 
-                // Super Chat（Agent 模式）：模型自主决策 —— 说话 → 调工具 → 看结果 → 决定继续或结束
-                // 免费车道强制 tool_choice=none，不支持工具，自动退化为普通聊天
-                val activeModel = state.config.models.find { it.id == state.config.activeModelId }
-                val superChatEnabled = state.config.superChat && activeModel?.freeGatewayFingerprint != true
-                val tools = if (superChatEnabled) toolRegistry.definitions else emptyList()
-
+                // Agent（Super Chat）模式为默认常开：模型自主决策 —— 说话 → 调工具 → 看结果 → 决定继续或结束
+                // 回复走 JSON 协议（content + done）：done=false 时客户端自动续写，直到说完或达到轮数上限
                 var hist = startMsgs                       // 演进中的消息链（含本条 userMsg）
                 var roundText = text
                 var roundAttachments = state.attachments
+                var roundExtraSystem: String? = null       // 请求级临时指令（如续写指令），不入对话历史
                 var lastToolRequest = false
                 var rounds = 0
-                val MAX_ROUNDS = 6
+                var toolRounds = 0
+                var autoRounds = 0
+                val MAX_TOOL_ROUNDS = 6
+                val maxAutoRounds = state.config.maxAutoRounds   // 0 = 无限续写
 
                 // 阶段式持久化：每轮完成立即落盘 + 刷新 UI，断线时保留已生成部分
                 suspend fun persistStage() {
@@ -352,42 +484,77 @@ class ChatViewModel(
                     _uiState.update { it.copy(messages = hist, streamingContent = null, streamingReasoning = null) }
                 }
 
-                while (rounds < MAX_ROUNDS) {
+                // 客户端过滤：流式中实时剥离 JSON 壳，只展示正文（解析失败时展示原文）
+                val onChunk: (String, String) -> Unit = { content, reasoning ->
+                    val reply = repository.parseJsonReply(content)
+                    _uiState.update { s ->
+                        s.copy(streamingContent = reply.content, streamingReasoning = reasoning)
+                    }
+                }
+
+                while (true) {
                     rounds++
-                    val result = repository.sendMessage(
-                        state.config,
-                        if (rounds == 1) hist.dropLast(1) else hist,
-                        roundText,
-                        onChunk = { content, reasoning ->
-                            _uiState.update { s ->
-                                s.copy(streamingContent = content, streamingReasoning = reasoning)
-                            }
-                        },
-                        isCancelled = { cancelled },
-                        sessionSeed = chatId,
+                    // 上下文压缩：估算超阈值时把最旧部分用 AI 摘要压缩（摘要失败回退窗口截断）
+                    val compacted = compactIfNeeded(hist, state.config)
+                    if (compacted !== hist) {
+                        hist = compacted
+                        persistStage()
+                    }
+                    // 记忆每轮重新读取：AI 可能在本轮通过 remember_memory 写入新记忆，下一轮立即生效
+                    val memoryNotes = repository.formatMemoryNotes()
+                    val result = sendWithRetry(
+                        config = state.config,
+                        messages = if (rounds == 1) hist.dropLast(1) else hist,
+                        text = roundText,
+                        onChunk = onChunk,
                         attachments = if (rounds == 1) roundAttachments else emptyList(),
-                        tools = tools
+                        tools = if (toolDegraded) emptyList() else toolRegistry.definitions,
+                        memoryNotes = memoryNotes,
+                        extraSystem = roundExtraSystem
                     )
                     lastToolRequest = result.toolCalls.isNotEmpty()
                     if (result.content == null && !lastToolRequest) {
                         // 用户取消：保留已发送的用户消息与已生成的阶段内容
                         _uiState.update {
                             it.copy(isLoading = false, streamingContent = null, streamingReasoning = null,
-                                    cancellable = false, attachments = emptyList())
+                                    cancellable = false, attachments = emptyList(), autoContinuing = false)
                         }
-                                return@launch
+                        return@launch
                     }
+                    val rawContent = result.content ?: ""
+                    val reply = repository.parseJsonReply(rawContent)
                     hist = hist + ChatMessage(
                         role = "assistant",
-                        content = result.content ?: "",
+                        content = reply.content,           // 过滤后的正文（剥掉 JSON 壳）
                         reasoning = result.reasoning ?: "",
                         durationMs = result.durationMs,
                         toolCalls = result.toolCalls.ifEmpty { null }
                     )
                     persistStage()   // 阶段式展示：本轮回复立即上屏
-                    if (!lastToolRequest) break   // 无工具请求 → 回合完成
 
-                    // 执行工具 → 结果作为 tool 消息回传，让模型决定下一步
+                    if (!lastToolRequest) {
+                        // 无工具请求：按 JSON 协议决定是否续写
+                        toolRounds = 0
+                        if (!reply.done && (maxAutoRounds == 0 || autoRounds < maxAutoRounds)) {
+                            autoRounds++
+                            // 方案 A：续写指令只注入本次请求（extraSystem），不写入对话历史/UI
+                            roundExtraSystem = CONTINUE_PROMPT
+                            _uiState.update { s -> s.copy(autoContinuing = true) }
+                            roundText = ""
+                            roundAttachments = emptyList()
+                            continue
+                        }
+                        _uiState.update { s -> s.copy(autoContinuing = false) }
+                        if (!reply.done && maxAutoRounds > 0) {
+                            _uiState.update { it.copy(toastMessage = "已达到 AI 自主续写上限（$maxAutoRounds 轮），已结束回合") }
+                        }
+                        break
+                    }
+
+                    // 工具请求：执行工具 → 结果作为 tool 消息回传，让模型决定下一步
+                    autoRounds = 0
+                    toolRounds++
+                    roundExtraSystem = null                // 工具轮不携带续写指令
                     for (call in result.toolCalls) {
                         _uiState.update { s -> s.copy(toolActivity = ToolActivity(call.name, "running", call.arguments)) }
                         val output = runToolWithApproval(call)
@@ -402,7 +569,11 @@ class ChatViewModel(
                         )
                         persistStage()   // 每个工具结果立即上屏
                     }
-                    if (rounds < MAX_ROUNDS) _uiState.update { s -> s.copy(toolActivity = null) }
+                    _uiState.update { s -> s.copy(toolActivity = null) }
+                    if (toolRounds >= MAX_TOOL_ROUNDS) {
+                        _uiState.update { it.copy(toastMessage = "已达到最大工具轮次（$MAX_TOOL_ROUNDS），已提前结束回合") }
+                        break
+                    }
                     roundText = ""           // 后续轮次不再插入用户文本
                     roundAttachments = emptyList()
                 }
@@ -411,20 +582,18 @@ class ChatViewModel(
                     it.copy(
                         isLoading = false, streamingContent = null, streamingReasoning = null, cancellable = false,
                         messages = hist,
-                        attachments = emptyList(), toolActivity = null, generationError = null
+                        attachments = emptyList(), toolActivity = null, autoContinuing = false, generationError = null,
+                        retryInfo = null
                     )
                 }
-                if (lastToolRequest) {
-                    _uiState.update { it.copy(toastMessage = "已达到最大工具轮次（$MAX_ROUNDS），已提前结束回合") }
-                }
             } catch (e: CancellationException) {
-                _uiState.update { it.copy(isLoading = false, streamingContent = null, streamingReasoning = null, cancellable = false) }
+                _uiState.update { it.copy(isLoading = false, streamingContent = null, streamingReasoning = null, cancellable = false, retryInfo = null) }
             } catch (e: Exception) {
                 // 断线/错误：保留用户消息与已生成的阶段内容，标记可重试（不再删除任何消息）
                 _uiState.update {
                     it.copy(
                         isLoading = false, streamingContent = null, streamingReasoning = null, cancellable = false,
-                        generationError = e.message ?: "连接中断，请重试", toolActivity = null
+                        generationError = e.message ?: "连接中断，请重试", toolActivity = null, retryInfo = null
                     )
                 }
             }
@@ -494,86 +663,6 @@ class ChatViewModel(
     }
 
     // ── 模型配置 ────────────────────────────────────────────────
-
-    /**
-     * 获取 OpenCode 免费模型：拉取网关清单（仅保留 id 带 free 的模型）→ 逐个实测速度与可用性 →
-     * 仅把「实测可用」的模型展示给用户（不可用的：地区受限 / 额度 / 超时 / 不支持接口，不展示）。
-     * 添加与否由用户点列表中的「添加」按钮决定，不自动添加。
-     */
-    fun fetchOpenCodeFreeModels() {
-        if (_uiState.value.fetchingFreeModels) return
-        viewModelScope.launch {
-            _uiState.update {
-                it.copy(
-                    fetchingFreeModels = true, freeModelError = null,
-                    freeModels = emptyList(), freeModelsLoaded = false,
-                    freeSpeedResults = emptyMap(), speedTestProgress = null
-                )
-            }
-            val models = repository.fetchOpenCodeFreeModels()
-            if (models.isEmpty()) {
-                _uiState.update {
-                    it.copy(
-                        fetchingFreeModels = false,
-                        freeModelError = "获取失败：无法访问 opencode.ai，或当前没有可用免费模型"
-                    )
-                }
-                return@launch
-            }
-            // 逐个实测（列表暂不展示，全部测完才一次性展示可用模型）
-            val usable = mutableListOf<OpenCodeFreeModel>()
-            val results = mutableMapOf<String, OpenCodeSpeedResult>()
-            models.forEachIndexed { index, model ->
-                _uiState.update { s -> s.copy(speedTestProgress = "${index + 1}/${models.size}") }
-                val res = repository.testOpenCodeModelSpeed(model)
-                results[model.id] = res
-                if (res.ok && res.latencyMs > 0) usable.add(model)
-                _uiState.update { s -> s.copy(freeSpeedResults = results.toMap()) }
-            }
-            if (usable.isEmpty()) {
-                _uiState.update {
-                    it.copy(
-                        fetchingFreeModels = false, speedTestProgress = null,
-                        freeModelError = "全部免费模型均不可用（地区受限 / 额度 / 超时），请稍后再试"
-                    )
-                }
-                return@launch
-            }
-            _uiState.update {
-                it.copy(
-                    fetchingFreeModels = false, freeModels = usable, freeModelsLoaded = true,
-                    speedTestProgress = null
-                )
-            }
-        }
-    }
-
-    /** 用户主动点击「添加」后才把模型加入配置（免费网关参数自动就绪） */
-    fun addOpenCodeModel(modelId: String) {
-        val entry = _uiState.value.freeModels.find { it.id == modelId } ?: return
-        viewModelScope.launch {
-            val existing = _uiState.value.config.models.map { it.model }.toSet()
-            if (modelId in existing) {
-                _uiState.update { it.copy(toastMessage = "该模型已在列表中") }
-                return@launch
-            }
-            val config = ModelConfig(
-                id = "free_$modelId",
-                name = entry.name,
-                apiUrl = "https://opencode.ai/zen/v1/chat/completions",
-                apiKey = "public",
-                model = entry.id,
-                temperature = 0.7f,
-                stream = true,
-                thinking = false,
-                freeGatewayFingerprint = true,
-                thinkingLevel = if (entry.reasoning) "balanced" else "off"
-            )
-            val newConfig = _uiState.value.config.copy(models = _uiState.value.config.models + config)
-            repository.saveConfig(newConfig)
-            _uiState.update { it.copy(toastMessage = "已添加 ${entry.name}，可在顶部切换使用") }
-        }
-    }
 
     fun setActiveModel(modelId: String) {
         viewModelScope.launch {
