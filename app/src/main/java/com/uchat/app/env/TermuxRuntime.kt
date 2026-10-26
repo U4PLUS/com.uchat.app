@@ -54,10 +54,31 @@ class TermuxRuntime(private val context: Context) {
 
     /** 重建状态（App 启动时调用）：若已安装则标记就绪 */
     fun refresh() {
+        // 启动时自动修复 exec 权限：旧版本解压的环境可能缺失执行位（导致 exec Permission denied），
+        // 无需手动重置即可恢复
+        repairExecPermissions()
         if (isReady()) {
             val size = try { prefix.listFiles()?.sumOf { it.length() } ?: 0L } catch (_: Exception) { 0L }
             _state.value = State.Ready(abiOf(), (size / 1024 / 1024).toInt())
         }
+    }
+
+    /** 修复 bin/libexec 下缺失的执行位（用系统 chmod 硬设置，Java setExecutable 在部分设备无效） */
+    private fun repairExecPermissions() {
+        try {
+            val targets = mutableListOf<File>()
+            listOf("bin", "libexec").forEach { d ->
+                File(prefix, d).listFiles()?.forEach { f -> if (!f.canExecute()) targets.add(f) }
+            }
+            if (targets.isEmpty()) return
+            val paths = targets.map { it.absolutePath }
+            // 分段执行避免参数过长
+            paths.chunked(40).forEach { chunk ->
+                val pb = ProcessBuilder(listOf("chmod", "755") + chunk)
+                pb.redirectErrorStream(true)
+                val p = pb.start(); p.inputStream.readBytes(); p.waitFor()
+            }
+        } catch (_: Exception) {}
     }
 
     /**
