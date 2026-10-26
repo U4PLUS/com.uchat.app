@@ -81,6 +81,8 @@ data class AppConfig(
     val contextLimitK: Int = 128,
     /** SSH 服务器配置（ssh_execute 工具使用） */
     val sshConfig: SshConfig = SshConfig(),
+    /** Termux 环境选择：null=首次未选择（弹出提示），true=已开启（解压安装），false=暂不开启（busybox） */
+    val termuxEnabled: Boolean? = null,
 )
 
 /** SSH 连接配置（模型通过 ssh_execute 工具连接远程服务器） */

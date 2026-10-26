@@ -72,6 +72,8 @@ class MainActivity : ComponentActivity() {
                         is UiIntent.SetContextLimitK -> { viewModel.setContextLimitK(intent.k) }
                         is UiIntent.SaveSshConfig -> { viewModel.saveSshConfig(intent.sshConfig) }
                         is UiIntent.InstallTermux -> { viewModel.installTermux() }
+                        is UiIntent.InitTermuxOptIn -> { viewModel.initTermuxOptIn(intent.enabled) }
+                        is UiIntent.ResetTermux -> { viewModel.resetTermux() }
                         is UiIntent.UninstallTermux -> { viewModel.uninstallTermux() }
                         is UiIntent.LoadMemories -> { viewModel.loadMemories() }
                         is UiIntent.DeleteMemory -> { viewModel.deleteMemory(intent.id) }

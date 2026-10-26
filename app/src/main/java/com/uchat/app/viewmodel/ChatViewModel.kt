@@ -318,6 +318,35 @@ class ChatViewModel(
         }
     }
 
+    /** 首次启动选择：enabled=true 开启并解压 Termux 环境；false 暂不开启（保持 busybox） */
+    fun initTermuxOptIn(enabled: Boolean) {
+        viewModelScope.launch {
+            val config = _uiState.value.config.copy(termuxEnabled = enabled)
+            repository.saveConfig(config)
+            if (enabled) {
+                try {
+                    val rt = (appContext.applicationContext as? com.uchat.app.AIChatApplication)?.termuxRuntime
+                    rt?.install()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /** 重置 Termux 环境：清除已解压环境后重新解压（未开启时也可用来开启） */
+    fun resetTermux() {
+        viewModelScope.launch {
+            try {
+                val app = appContext.applicationContext as? com.uchat.app.AIChatApplication ?: return@launch
+                val rt = app.termuxRuntime
+                rt.uninstall()
+                _uiState.update { it.copy(termuxState = com.uchat.app.env.TermuxRuntime.State.NotInstalled) }
+                val config = _uiState.value.config.copy(termuxEnabled = true)
+                repository.saveConfig(config)
+                rt.install()
+            } catch (_: Exception) {}
+        }
+    }
+
     fun uninstallTermux() {
         try {
             val rt = (appContext.applicationContext as? com.uchat.app.AIChatApplication)?.termuxRuntime ?: return

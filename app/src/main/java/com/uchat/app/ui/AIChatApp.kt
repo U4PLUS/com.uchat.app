@@ -258,6 +258,26 @@ fun ChatHome(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
     var terminalOpen by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize()) {
+        // 首次启动：询问是否开启 Termux 完整环境（选择后可随时在设置页开启/重置）
+        val needTermuxPrompt = remember(uiState.config.termuxEnabled, uiState.termuxState) {
+            uiState.config.termuxEnabled == null && uiState.termuxState !is TermuxRuntime.State.Ready
+        }
+        if (needTermuxPrompt) {
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text("启用 Termux 完整环境？") },
+                text = {
+                    Text("为 AI 提供完整 Linux 环境（bash/apt/软件包，可安装 python/git/ssh 等），并支持聊天页终端。环境已内置（约 100MB，离线解压）。\n\n不开启则继续使用轻量 busybox 沙箱；之后可在 设置 → Termux 环境 随时开启或重置。")
+                },
+                confirmButton = {
+                    TextButton(onClick = { onIntent(UiIntent.InitTermuxOptIn(true)) }) { Text("开启并解压") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { onIntent(UiIntent.InitTermuxOptIn(false)) }) { Text("暂不开启") }
+                }
+            )
+        }
+
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
@@ -673,6 +693,10 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    // Termux 终端标志：点击切换到终端（或右边缘左滑）
+                    IconButton(onClick = onOpenTerminal) {
+                        Icon(Icons.Default.Terminal, contentDescription = "Termux 终端", modifier = Modifier.size(20.dp))
+                    }
                     // Regenerate
                     if (uiState.messages.isNotEmpty() && !uiState.isLoading) {
                         IconButton(onClick = { onIntent(UiIntent.Regenerate) }) {
@@ -2288,11 +2312,18 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
                 Spacer(modifier = Modifier.height(10.dp))
                 when (val ts = uiState.termuxState) {
                     is TermuxRuntime.State.NotInstalled -> {
+                        if (uiState.config.termuxEnabled == false) {
+                            Text(
+                                "当前为 busybox 降级模式（首次启动时选择暂不开启）。点击下方按钮开启完整环境。",
+                                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                         Button(
-                            onClick = { onIntent(UiIntent.InstallTermux) },
+                            onClick = { onIntent(UiIntent.InitTermuxOptIn(true)) },
                             modifier = Modifier.fillMaxWidth().height(44.dp),
                             shape = RoundedCornerShape(10.dp)
-                        ) { Text("下载安装 Termux 环境") }
+                        ) { Text("开启并解压 Termux 环境") }
                     }
                     is TermuxRuntime.State.Downloading -> {
                         Text("正在下载… ${ts.percent}%", fontSize = 12.sp)
@@ -2308,16 +2339,16 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
                         Text("✓ 已就绪（${ts.abi}，约 ${ts.sizeMb}MB）", fontSize = 12.sp, color = Color(0xFF2E7D32))
                         Spacer(modifier = Modifier.height(8.dp))
                         Button(
-                            onClick = { onIntent(UiIntent.UninstallTermux) },
+                            onClick = { onIntent(UiIntent.ResetTermux) },
                             modifier = Modifier.fillMaxWidth().height(40.dp),
                             shape = RoundedCornerShape(10.dp)
-                        ) { Text("卸载环境") }
+                        ) { Text("重置环境（清除后重新解压）") }
                     }
                     is TermuxRuntime.State.Failed -> {
                         Text("✗ 安装失败：${ts.reason}", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
                         Spacer(modifier = Modifier.height(8.dp))
                         Button(
-                            onClick = { onIntent(UiIntent.InstallTermux) },
+                            onClick = { onIntent(UiIntent.InitTermuxOptIn(true)) },
                             modifier = Modifier.fillMaxWidth().height(44.dp),
                             shape = RoundedCornerShape(10.dp)
                         ) { Text("重试安装") }
@@ -3352,8 +3383,14 @@ sealed class UiIntent {
     data class SetContextLimitK(val k: Int) : UiIntent()
     data class SaveSshConfig(val sshConfig: SshConfig) : UiIntent()
 
-    /** 安装 Termux 环境（设置页按钮触发，下载进度经 uiState.termuxState 回显） */
+    /** 安装 Termux 环境（设置页按钮触发，进度经 uiState.termuxState 回显） */
     object InstallTermux : UiIntent()
+
+    /** 首次启动选择 Termux 环境（true=开启解压，false=暂不开启 busybox） */
+    data class InitTermuxOptIn(val enabled: Boolean) : UiIntent()
+
+    /** 重置 Termux 环境：清除后重新解压（也可用于首次未开启时开启） */
+    object ResetTermux : UiIntent()
 
     /** 卸载 Termux 环境 */
     object UninstallTermux : UiIntent()

@@ -20,6 +20,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -33,6 +34,8 @@ import com.termux.view.TerminalView
 import com.uchat.app.AIChatApplication
 import com.uchat.app.env.TermuxRuntime
 import android.view.inputmethod.InputMethodManager
+import androidx.compose.material3.Button
+import kotlinx.coroutines.launch
 
 /**
  * Termux 终端面板：TerminalView（pty bash 会话） + 顶部栏。
@@ -41,6 +44,7 @@ import android.view.inputmethod.InputMethodManager
 @Composable
 fun TerminalPanel(onClose: () -> Unit, termuxRuntime: TermuxRuntime) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     Column(
         modifier = Modifier
             .fillMaxHeight()
@@ -82,7 +86,22 @@ fun TerminalPanel(onClose: () -> Unit, termuxRuntime: TermuxRuntime) {
                 Icon(Icons.Default.Close, contentDescription = "关闭终端", tint = ComposeColor.White)
             }
         }
-        // 终端视图
+        // 终端视图（环境未就绪时提示安装）
+        if (!termuxRuntime.isReady()) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Termux 环境未就绪", color = ComposeColor.White, fontSize = 16.sp)
+                    androidx.compose.foundation.layout.Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "开启后即可使用完整 Linux 终端（bash/apt 等），\n安装解压约需 1 分钟",
+                        color = ComposeColor(0xFF999999), fontSize = 12.sp,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    androidx.compose.foundation.layout.Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = { scope.launch { termuxRuntime.install() } }) { Text("安装 Termux 环境") }
+                }
+            }
+        } else {
         AndroidView(
             factory = { ctx ->
                 TerminalView(ctx, null).apply {
@@ -109,6 +128,7 @@ fun TerminalPanel(onClose: () -> Unit, termuxRuntime: TermuxRuntime) {
                 .weight(1f)
                 .fillMaxWidth()
         )
+        }
     }
 }
 
