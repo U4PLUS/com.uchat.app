@@ -61,8 +61,9 @@ class TermuxRuntime(private val context: Context) {
     }
 
     /**
-     * 安装：下载对应变体 APK → 提取本机 ABI 的 bootstrap → 解压到 prefix → 修复权限/符号链接。
-     * 在后台协程调用。
+     * 安装 Termux 环境：
+     * - Android 8+：从内置 assets（termux-bootstrap/<abi>.bin，apt-android-7 变体）直接解包，离线可用；
+     * - Android 5-7：老设备兼容变体（apt-android-5，interpreter=/system/bin/linker）运行时下载后解包。
      */
     suspend fun install() {
         if (isReady()) return
@@ -70,26 +71,27 @@ class TermuxRuntime(private val context: Context) {
         val apkCache = File(context.cacheDir, "termux_${variant}.apk")
         val soTmp = File(context.cacheDir, "libtermux-bootstrap_${abiOf()}.so")
         try {
-            // 1) 下载 APK（gh-proxy 优先，失败直连官方）
-            val apkUrl = "https://gh-proxy.org/https://github.com/termux/termux-app/releases/download/v0.119.0-beta.1/" +
-                "termux-app_v0.119.0-beta.1%2B${variant}-github-debug_universal.apk"
-            val directUrl = "https://github.com/termux/termux-app/releases/download/v0.119.0-beta.1/" +
-                "termux-app_v0.119.0-beta.1%2B${variant}-github-debug_universal.apk"
-            downloadFile(apkUrl, apkCache) { _state.value = State.Downloading(it) } ||
-                downloadFile(directUrl, apkCache) { _state.value = State.Downloading(it) } ||
-                throw Exception("下载 Termux 环境失败（两个源均不可达）")
-
-            // 2) 从 APK 提取本机 ABI 的 bootstrap so
-            _state.value = State.Extracting
-            ZipFile(apkCache).use { apk ->
-                val entry = apk.getEntry("lib/${abiOf()}/libtermux-bootstrap.so")
-                    ?: throw Exception("APK 中缺少 ${abiOf()} 的 bootstrap")
-                apk.getInputStream(entry).use { input ->
-                    soTmp.outputStream().use { out -> input.copyTo(out) }
+            // 1) 获取本机 ABI 的 bootstrap：Android 8+ 从内置 assets 离线解包；老设备下载 apt-android-5 变体
+            val embedded = Build.VERSION.SDK_INT >= 26 && extractFromAssets(soTmp)
+            if (!embedded) {
+                val apkUrl = "https://gh-proxy.org/https://github.com/termux/termux-app/releases/download/v0.119.0-beta.1/" +
+                    "termux-app_v0.119.0-beta.1%2B${variant}-github-debug_universal.apk"
+                val directUrl = "https://github.com/termux/termux-app/releases/download/v0.119.0-beta.1/" +
+                    "termux-app_v0.119.0-beta.1%2B${variant}-github-debug_universal.apk"
+                downloadFile(apkUrl, apkCache) { _state.value = State.Downloading(it) } ||
+                    downloadFile(directUrl, apkCache) { _state.value = State.Downloading(it) } ||
+                    throw Exception("下载 Termux 环境失败（两个源均不可达）")
+                _state.value = State.Extracting
+                ZipFile(apkCache).use { apk ->
+                    val entry = apk.getEntry("lib/${abiOf()}/libtermux-bootstrap.so")
+                        ?: throw Exception("APK 中缺少 ${abiOf()} 的 bootstrap")
+                    apk.getInputStream(entry).use { input ->
+                        soTmp.outputStream().use { out -> input.copyTo(out) }
+                    }
                 }
             }
 
-            // 3) 解压 bootstrap（so 内嵌 zip）到 prefix
+            // 2) 解压 bootstrap（so 内嵌 zip）到 prefix
             val target = prefix
             if (target.exists()) target.deleteRecursively()
             target.parentFile?.mkdirs()
@@ -221,6 +223,18 @@ class TermuxRuntime(private val context: Context) {
         "TERMUX_VERSION=0.119.0",
         "TERMUX_IS_DEBUGGABLE_BUILD=0"
     )
+
+    /** 从内置 assets 复制本机 ABI 的 bootstrap 到缓存文件（返回是否成功） */
+    private fun extractFromAssets(target: File): Boolean {
+        return try {
+            context.assets.open("termux-bootstrap/${abiOf()}.bin").use { input ->
+                target.outputStream().use { out -> input.copyTo(out) }
+            }
+            target.length() > 0
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     /** 带进度下载（返回是否成功） */
     private fun downloadFile(url: String, target: File, onProgress: (Int) -> Unit): Boolean {

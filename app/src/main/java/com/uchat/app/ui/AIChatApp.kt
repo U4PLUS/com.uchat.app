@@ -2282,7 +2282,7 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
                 Text("Termux 环境", fontSize = 14.sp, fontWeight = FontWeight.Medium)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "为 AI 提供完整 Linux 环境（bash/apt/软件包），聊天页右滑可打开终端。安装需下载约 78MB 并解压（Android 8+ 用新版，Android 5-7 自动用兼容变体）。",
+                    "为 AI 提供完整 Linux 环境（bash/apt/软件包），聊天页右滑可打开终端。bootstrap 已内置（4 种 CPU 架构），Android 8+ 一键离线解压安装；Android 5-7 老设备首次联网自动下载兼容变体。",
                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(10.dp))
