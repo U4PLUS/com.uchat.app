@@ -1,3 +1,14 @@
+# AI Chat v1.3.0-dev（2026-10-26，dev 分支开发中）
+
+> 基线：v1.2.0（652e3fc）。本版本正在 dev 分支开发，未发布。
+
+## Termux 完整环境 + 终端
+- 内置 Termux bootstrap 运行时：assets 打包全部 4 种 CPU 架构（arm64/arm32/x86/x86_64，apt-android-7 变体，~100MB）；
+- 安装逻辑：Android 8+ 从内置 assets **离线解压**（无需联网）；Android 5-7 老设备自动联网下载 apt-android-5 兼容变体（interpreter=/system/bin/linker）；
+- 聊天页**右边缘左滑**打开 Termux 终端抽屉（TerminalView + pty bash 会话，终端组件源码集成自 termux-app，4 ABI libtermux.so 容器交叉编译）；
+- 设置 → 环境新增「Termux 环境」卡片：安装进度（解压中）/已就绪（ABI/体积）/卸载/失败重试；
+- `run_shell` 工具升级：Termux 就绪时在完整 Linux 环境执行（支持 `pkg install` 安装软件包），未就绪自动降级 busybox 白名单；危险等级 3（调用前确认）+ 拦截 `rm -rf` 递归删除防自毁。
+
 # AI Chat v1.2.0（2026-10-26 发布）
 
 > 基线：v1.1.0（ed9798e）。本版本累计未提交功能已全部合入并发布。
