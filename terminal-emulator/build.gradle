@@ -1,0 +1,32 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace "com.termux.emulator"
+    compileSdkVersion 34
+
+    defaultConfig {
+        minSdkVersion 21
+        targetSdkVersion 34
+
+        // pty 子进程 native 库由 jniLibs 提供（容器交叉编译，见 src/main/jniLibs/<abi>/libtermux.so）
+        ndk {
+            abiFilters 'x86', 'x86_64', 'armeabi-v7a', 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation "androidx.annotation:annotation:1.9.0"
+}

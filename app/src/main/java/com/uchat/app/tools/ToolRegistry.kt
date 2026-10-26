@@ -28,6 +28,9 @@ class ToolRegistry(private val context: Context) {
     /** SSH 能力回调（ssh_execute 由上层注入，复用设置页配置的连接） */
     var sshOps: com.uchat.app.data.SSHOps? = null
 
+    /** Termux 运行时（run_shell 完整环境，由上层注入） */
+    var termuxRuntime: com.uchat.app.env.TermuxRuntime? = null
+
     /** 工具定义列表（随每个请求发给模型的 tools 数组） */
     val definitions: List<ToolDef> = listOf(
         ToolDef(
@@ -47,9 +50,9 @@ class ToolRegistry(private val context: Context) {
         ToolDef(
             id = "run_shell",
             name = "run_shell",
-            description = "在沙箱 shell 中执行命令（内置 busybox，全架构兼容）。白名单命令：echo cat grep egrep sed awk sort head tail wc date cut tr uniq base64 printf ls find stat bc expr seq fold pwd id whoami uname uptime df du free touch mkdir tee cp xargs yes wget tar gzip gunzip md5sum sha1sum sha256sum od xxd which env time。仅 wget 可以联网（HTTP/HTTPS，用于下载/抓取）。禁止绝对路径、禁止 '..'、禁止重定向，禁止 rm/chmod/chown/mv/su/curl 等破坏性或提权命令。工作目录为 App 私有沙箱目录。",
-            parameters = """{"type":"object","properties":{"command":{"type":"string","description":"要执行的 shell 命令，如：echo hello 或 grep -n error notes.txt 或 wget -qO page.html https://example.com"}},"required":["command"]}""",
-            dangerLevel = 2
+            description = "在 Linux 环境中执行命令。已安装 Termux 环境时为完整环境（bash + coreutils + apt，可联网，支持 pkg install 安装软件包【安装操作需用户确认，等待确认结果】、python/git/ssh 等）；Termux 环境未安装或不可用时降级为内置 busybox 白名单沙箱（echo cat grep sed awk sort wget 等基础命令，仅 wget 可联网）。工作目录为 App 私有沙箱目录。危险等级 3：执行前需用户点击确认。",
+            parameters = """{"type":"object","properties":{"command":{"type":"string","description":"要执行的 shell 命令，如：echo hello 或 uname -a 或 pkg search python 或 wget -qO page.html https://example.com"}},"required":["command"]}""",
+            dangerLevel = 3
         ),
         ToolDef(
             id = "web_search",
@@ -208,11 +211,22 @@ class ToolRegistry(private val context: Context) {
     private fun shQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
 
     /** busybox 沙箱：白名单命令 + 目录/路径限制 + 兼容低版本 API 的超时 + 输出截断 */
-    private fun runSafeShell(command: String): String {
+    private suspend fun runSafeShell(command: String): String {
         if (command.isBlank()) return "错误：缺少参数 command"
+        val runtime = termuxRuntime
+        if (runtime?.isReady() == true) {
+            // ── Termux 完整环境 ──
+            val lower = command.lowercase(Locale.ROOT)
+            // 自毁防护：完整环境下仍禁止递归删除（rm -rf 指向运行时/家目录会摧毁环境）
+            if (lower.contains("rm -rf") || lower.contains("rm -fr") || lower.contains("rm -r -f")) {
+                return "错误：出于安全考虑，Termux 环境禁止 rm -rf 递归删除；请用 rm 精确删除单个文件，或换用 find 列出后确认"
+            }
+            return runtime.execBash(command, workDir)
+        }
+        // ── busybox 白名单 fallback（环境未就绪时）──
         val first = command.trim().split(Regex("\\s+"), limit = 2)[0]
         if (first !in ALLOWED_COMMANDS) {
-            return "错误：命令 $first 不在白名单内。可用：${ALLOWED_COMMANDS.joinToString(" ")}"
+            return "错误：Termux 环境未安装，当前为 busybox 降级模式。命令 $first 不在白名单内。可用：${ALLOWED_COMMANDS.joinToString(" ")}（可在设置 → Termux 环境安装完整环境）"
         }
         val lower = command.lowercase(Locale.ROOT)
         DANGEROUS_TOKENS.forEach { token ->

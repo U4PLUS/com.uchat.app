@@ -77,6 +77,8 @@ data class ChatUiState(
     val attachments: List<SendAttachment> = emptyList(),
     /** 进行中的工具调用（Agent 模式） */
     val toolActivity: ToolActivity? = null,
+    /** Termux 环境安装状态（设置页 Termux 卡片展示） */
+    val termuxState: com.uchat.app.env.TermuxRuntime.State = com.uchat.app.env.TermuxRuntime.State.NotInstalled,
     /** 待用户授权（L3 工具调用） */
     val pendingApproval: PendingToolApproval? = null,
     /** 长期记忆列表（设置页查看/管理） */
@@ -117,6 +119,15 @@ class ChatViewModel(
     private var toolDegraded = false
 
     init {
+        // Termux 环境状态订阅（下载/解压/就绪进度实时进 uiState）
+        viewModelScope.launch {
+            try {
+                val rt = (appContext.applicationContext as? com.uchat.app.AIChatApplication)?.termuxRuntime
+                if (rt != null) {
+                    rt.state.collect { st -> _uiState.update { it.copy(termuxState = st) } }
+                }
+            } catch (_: Exception) {}
+        }
         viewModelScope.launch {
             // ── 持续订阅：配置 / 聊天记录 ──
             combine(repository.configFlow, repository.chatsFlow) { config, chats ->
@@ -296,6 +307,23 @@ class ChatViewModel(
             val config = _uiState.value.config.copy(sshConfig = ssh)
             repository.saveConfig(config)
         }
+    }
+
+    fun installTermux() {
+        viewModelScope.launch {
+            try {
+                val rt = (appContext.applicationContext as? com.uchat.app.AIChatApplication)?.termuxRuntime ?: return@launch
+                rt.install()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun uninstallTermux() {
+        try {
+            val rt = (appContext.applicationContext as? com.uchat.app.AIChatApplication)?.termuxRuntime ?: return
+            rt.uninstall()
+            _uiState.update { it.copy(termuxState = com.uchat.app.env.TermuxRuntime.State.NotInstalled) }
+        } catch (_: Exception) {}
     }
 
     // ── 自动重试：网络/5xx 错误最多重试 10 次，每次间隔 5 秒，UI 显示错误消息 ──

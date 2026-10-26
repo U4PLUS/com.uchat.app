@@ -16,6 +16,8 @@ class AIChatApplication : Application() {
         private set
     lateinit var toolRegistry: ToolRegistry
         private set
+    lateinit var termuxRuntime: com.uchat.app.env.TermuxRuntime
+        private set
 
     private var prevHandler: Thread.UncaughtExceptionHandler? = null
 
@@ -30,11 +32,13 @@ class AIChatApplication : Application() {
                 }
             } catch (_: Exception) {}
         }
+        termuxRuntime = com.uchat.app.env.TermuxRuntime(this).also { it.refresh() }
         repository = AppRepository(this)
         toolRegistry = ToolRegistry(this).apply {
             memoryOps = repository
             netOps = repository
             sshOps = repository
+            termuxRuntime = this@AIChatApplication.termuxRuntime
         }
         // 崩溃处理：写 crash.log → 启动应用内崩溃页（显示堆栈/复制/重启），不弹系统闪退窗
         // 防循环：60 秒内崩溃超过 3 次则交给系统默认处理（避免崩溃页反复崩）

@@ -21,3 +21,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "AIChat"
 include(":app")
+include(":terminal-view")
+include(":terminal-emulator")

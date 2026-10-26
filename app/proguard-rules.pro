@@ -25,3 +25,8 @@
 -dontwarn org.newsclub.net.unix.**
 -dontwarn javax.security.auth.**
 -dontwarn org.apache.commons.logging.**
+
+# ── Termux 终端模块 ──
+# TerminalView/TerminalSession 与 Android View 系统交互，保持类名与方法不被混淆
+-keep class com.termux.view.** { *; }
+-keep class com.termux.terminal.** { *; }

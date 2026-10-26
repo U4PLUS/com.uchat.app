@@ -17,6 +17,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -38,6 +40,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
@@ -82,6 +86,7 @@ import com.uchat.app.data.MemoryEntry
 import com.uchat.app.data.ModelConfig
 import com.uchat.app.data.SendAttachment
 import com.uchat.app.data.SshConfig
+import com.uchat.app.env.TermuxRuntime
 import com.uchat.app.data.TlsConfig
 import com.uchat.app.data.ToolCallData
 import com.uchat.app.data.extractMarkdownBlocks
@@ -249,36 +254,71 @@ fun AIChatApp(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
 fun ChatHome(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    // 右侧 Termux 终端面板（右边缘左滑打开）
+    var terminalOpen by remember { mutableStateOf(false) }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
-        drawerContent = {
-            // 左抽屉：窄幅 + 右侧描边分界（与主界面背景区分）
+    Box(modifier = Modifier.fillMaxSize()) {
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                // 左抽屉：窄幅 + 右侧描边分界（与主界面背景区分）
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.5f)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(
+                            width = 1.dp,
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+                            shape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp)
+                        )
+                        .clip(RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp))
+                ) {
+                    DrawerContent(
+                        uiState = uiState,
+                        onIntent = onIntent,
+                        onClose = { scope.launch { drawerState.close() } }
+                    )
+                }
+            }
+        ) {
+            ChatScreen(
+                uiState = uiState,
+                onIntent = onIntent,
+                onOpenMenu = { scope.launch { drawerState.open() } },
+                onOpenTerminal = { terminalOpen = true }
+            )
+        }
+
+        // 右侧 Termux 终端抽屉（从右边缘滑入覆盖）
+        AnimatedVisibility(
+            visible = terminalOpen,
+            enter = slideInHorizontally(initialOffsetX = { it }),
+            exit = slideOutHorizontally(targetOffsetX = { it }),
+            modifier = Modifier.align(Alignment.CenterEnd)
+        ) {
             Box(
                 modifier = Modifier
-                    .fillMaxWidth(0.5f)
                     .fillMaxHeight()
+                    .fillMaxWidth(0.85f)
                     .background(MaterialTheme.colorScheme.surface)
                     .border(
                         width = 1.dp,
                         color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
-                        shape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp)
+                        shape = RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp)
                     )
-                    .clip(RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp))
+                    .clip(RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp))
             ) {
-                DrawerContent(
-                    uiState = uiState,
-                    onIntent = onIntent,
-                    onClose = { scope.launch { drawerState.close() } }
-                )
+                val runtime = rememberTermuxRuntime()
+                if (runtime != null) {
+                    TerminalPanel(onClose = { terminalOpen = false }, termuxRuntime = runtime)
+                } else {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("Termux 运行时不可用")
+                    }
+                }
             }
         }
-    ) {
-        ChatScreen(
-            uiState = uiState,
-            onIntent = onIntent,
-            onOpenMenu = { scope.launch { drawerState.open() } }
-        )
     }
 }
 
@@ -466,7 +506,8 @@ private fun ExportShareSheet(content: String, onDismiss: () -> Unit) {
 fun ChatScreen(
     uiState: ChatUiState,
     onIntent: (UiIntent) -> Unit,
-    onOpenMenu: () -> Unit = {}
+    onOpenMenu: () -> Unit = {},
+    onOpenTerminal: () -> Unit = {}
 ) {
     val activeModel = uiState.config.models.find { it.id == uiState.config.activeModelId }?.name
         ?: (if (uiState.config.models.isEmpty()) "选择模型" else "AI 聊天")
@@ -673,7 +714,29 @@ fun ChatScreen(
             )
         }
     ) { pad ->
-        Column(modifier = Modifier.fillMaxSize().padding(pad)) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(pad)
+                // 右边缘左滑 → 打开右侧 Termux 终端（与左抽屉手势对称）
+                .pointerInput(Unit) {
+                    var startX = 0f
+                    var dragTotal = 0f
+                    detectHorizontalDragGestures(
+                        onDragStart = { offset ->
+                            startX = offset.x
+                            dragTotal = 0f
+                        },
+                        onHorizontalDrag = { _, dragAmount -> dragTotal += dragAmount },
+                        onDragEnd = {
+                            val w = size.width
+                            val threshold = -100.dp.toPx()
+                            if (startX > w * 0.72f && dragTotal < threshold) onOpenTerminal()
+                        },
+                        onDragCancel = {}
+                    )
+                }
+        ) {
             // 附件预览条（输入框上方）
             if (uiState.attachments.isNotEmpty()) {
                 Row(
@@ -2206,6 +2269,63 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
 
         Spacer(modifier = Modifier.height(10.dp))
 
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Termux 环境（run_shell 完整环境 + 聊天页终端）
+        Surface(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("Termux 环境", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "为 AI 提供完整 Linux 环境（bash/apt/软件包），聊天页右滑可打开终端。安装需下载约 78MB 并解压（Android 8+ 用新版，Android 5-7 自动用兼容变体）。",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                when (val ts = uiState.termuxState) {
+                    is TermuxRuntime.State.NotInstalled -> {
+                        Button(
+                            onClick = { onIntent(UiIntent.InstallTermux) },
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) { Text("下载安装 Termux 环境") }
+                    }
+                    is TermuxRuntime.State.Downloading -> {
+                        Text("正在下载… ${ts.percent}%", fontSize = 12.sp)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(progress = { ts.percent / 100f }, modifier = Modifier.fillMaxWidth())
+                    }
+                    TermuxRuntime.State.Extracting -> {
+                        Text("正在解压…", fontSize = 12.sp)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    is TermuxRuntime.State.Ready -> {
+                        Text("✓ 已就绪（${ts.abi}，约 ${ts.sizeMb}MB）", fontSize = 12.sp, color = Color(0xFF2E7D32))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = { onIntent(UiIntent.UninstallTermux) },
+                            modifier = Modifier.fillMaxWidth().height(40.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) { Text("卸载环境") }
+                    }
+                    is TermuxRuntime.State.Failed -> {
+                        Text("✗ 安装失败：${ts.reason}", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = { onIntent(UiIntent.InstallTermux) },
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) { Text("重试安装") }
+                    }
+                }
+            }
+        }
+
         // SSH 服务器配置（ssh_execute 工具）
         Surface(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
@@ -3231,6 +3351,12 @@ sealed class UiIntent {
     data class SetMaxAutoRounds(val rounds: Int) : UiIntent()
     data class SetContextLimitK(val k: Int) : UiIntent()
     data class SaveSshConfig(val sshConfig: SshConfig) : UiIntent()
+
+    /** 安装 Termux 环境（设置页按钮触发，下载进度经 uiState.termuxState 回显） */
+    object InstallTermux : UiIntent()
+
+    /** 卸载 Termux 环境 */
+    object UninstallTermux : UiIntent()
     data object LoadMemories : UiIntent()
     data class DeleteMemory(val id: String) : UiIntent()
     data object ClearMemories : UiIntent()

@@ -39,7 +39,7 @@ android {
         compose = true
     }
 
-    packaging {
+    packagingOptions {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -61,6 +61,8 @@ dependencies {
     implementation("com.github.mwiede:jsch:0.2.16")
     // 老设备（Android <8）JCE 缺少 EC 椭圆曲线实现，SSH 密钥交换/签名需要 BouncyCastle 兜底
     implementation("org.bouncycastle:bcprov-jdk15on:1.70")
+    // Termux 终端：TerminalView（渲染/输入/手势）+ TerminalEmulator（会话/终端模拟，含 pty native）
+    implementation(project(":terminal-view"))
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
