@@ -6,7 +6,7 @@
 - **首次启动引导**：询问是否开启 Termux 完整环境 ——「开启并解压」= 内置 bootstrap 离线解压（约 1 分钟）；「暂不开启」= 继续使用轻量 busybox 沙箱；选择存入配置，之后可随时更改；
 - **设置页「重置环境」**：清除已解压环境后重新解压；首次未开启时也可在此点击开启并解压；
 - **聊天页 Termux 标志**：顶部栏新增终端图标，点击直接切换到终端（与右边缘左滑等效）；环境未就绪时终端面板显示安装提示并可一键安装；
-- 内置 Termux bootstrap 运行时：assets 打包全部 4 种 CPU 架构（arm64/arm32/x86/x86_64，apt-android-7 变体，~100MB）；
+- 内置 Termux bootstrap 运行时：assets 打包 **arm64（v8a）**（apt-android-7 变体，~26MB，控制 APK 体积便于下载）；其它架构（arm32/x86）与老设备首次开启时联网自动下载对应变体；
 - 安装逻辑：Android 8+ 从内置 assets **离线解压**（无需联网）；Android 5-7 老设备自动联网下载 apt-android-5 兼容变体（interpreter=/system/bin/linker）；
 - 聊天页**右边缘左滑**打开 Termux 终端抽屉（TerminalView + pty bash 会话，终端组件源码集成自 termux-app，4 ABI libtermux.so 容器交叉编译）；
 - 设置 → 环境新增「Termux 环境」卡片：安装进度（解压中）/已就绪（ABI/体积）/卸载/失败重试；

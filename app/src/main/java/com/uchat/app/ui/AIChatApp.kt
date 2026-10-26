@@ -267,7 +267,7 @@ fun ChatHome(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
                 onDismissRequest = {},
                 title = { Text("启用 Termux 完整环境？") },
                 text = {
-                    Text("为 AI 提供完整 Linux 环境（bash/apt/软件包，可安装 python/git/ssh 等），并支持聊天页终端。环境已内置（约 100MB，离线解压）。\n\n不开启则继续使用轻量 busybox 沙箱；之后可在 设置 → Termux 环境 随时开启或重置。")
+                    Text("为 AI 提供完整 Linux 环境（bash/apt/软件包，可安装 python/git/ssh 等），并支持聊天页终端。arm64 设备已内置环境（离线解压约需 1 分钟）；其它架构首次开启时联网下载。\n\n不开启则继续使用轻量 busybox 沙箱；之后可在 设置 → Termux 环境 随时开启或重置。")
                 },
                 confirmButton = {
                     TextButton(onClick = { onIntent(UiIntent.InitTermuxOptIn(true)) }) { Text("开启并解压") }
@@ -2306,7 +2306,7 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
                 Text("Termux 环境", fontSize = 14.sp, fontWeight = FontWeight.Medium)
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "为 AI 提供完整 Linux 环境（bash/apt/软件包），聊天页右滑可打开终端。bootstrap 已内置（4 种 CPU 架构），Android 8+ 一键离线解压安装；Android 5-7 老设备首次联网自动下载兼容变体。",
+                    "为 AI 提供完整 Linux 环境（bash/apt/软件包），聊天页右滑可打开终端。bootstrap 已内置 arm64（v8a），Android 8+ 一键离线解压；其它架构（arm32/x86）与老设备首次联网自动下载。",
                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(10.dp))

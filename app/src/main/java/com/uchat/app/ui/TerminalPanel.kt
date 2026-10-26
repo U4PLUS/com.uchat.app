@@ -107,6 +107,8 @@ fun TerminalPanel(onClose: () -> Unit, termuxRuntime: TermuxRuntime) {
                 TerminalView(ctx, null).apply {
                     val client = TermuxTerminalClient(ctx, this) {}
                     setTerminalViewClient(client)
+                    // 必须先用 setTextSize 初始化渲染器（字体度量），否则 attachSession→updateSize 会因 mRenderer=null 崩溃
+                    setTextSize(12)
                     // 首次布局完成后 attach 会话（attachSession 内部会启动 pty bash 子进程）
                     var attached = false
                     addOnLayoutChangeListener { v, l, t, r, b, ol, ot, or, ob ->
