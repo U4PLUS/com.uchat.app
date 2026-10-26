@@ -107,11 +107,7 @@ class TermuxRuntime(private val context: Context) {
                 }
             }
 
-            // 4) 修复权限：bin / libexec 下的程序需可执行
-            File(target, "bin").listFiles()?.forEach { it.setExecutable(true, false) }
-            File(target, "libexec").listFiles()?.forEach { it.setExecutable(true, false) }
-
-            // 5) 按 SYMLINKS.txt 重建符号链接（格式：链接名←目标，相对 prefix 根）
+            // 4) 按 SYMLINKS.txt 重建符号链接（格式：链接名←目标，相对 prefix 根）
             val symlinksFile = File(target, "SYMLINKS.txt")
             if (symlinksFile.exists()) {
                 symlinksFile.readLines().forEach { line ->
@@ -127,6 +123,27 @@ class TermuxRuntime(private val context: Context) {
                         // 个别链接失败不影响整体
                     }
                 }
+            }
+
+            // 5) 修复权限：bin / libexec 下的程序需可执行（用系统 chmod 硬设置，链接目标一并生效；
+            //    必须在符号链接重建之后执行，且不用 Java setExecutable——它在部分设备上对 data 目录文件不生效）
+            run {
+                val targets = mutableListOf<String>()
+                listOf("bin", "libexec", "bin/sh").forEach { d ->
+                    File(target, d).listFiles()?.forEach { targets.add(it.absolutePath) }
+                }
+                if (targets.isNotEmpty()) {
+                    try {
+                        val pb = ProcessBuilder(listOf("chmod", "755") + targets)
+                        pb.redirectErrorStream(true)
+                        val p = pb.start(); p.inputStream.readBytes(); p.waitFor()
+                    } catch (_: Exception) {}
+                }
+                try {
+                    val pb = ProcessBuilder("chmod", "755", File(target, "bin/bash").absolutePath)
+                    pb.redirectErrorStream(true)
+                    val p = pb.start(); p.inputStream.readBytes(); p.waitFor()
+                } catch (_: Exception) {}
             }
 
             // 6) 校验
