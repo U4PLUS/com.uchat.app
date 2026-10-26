@@ -68,6 +68,8 @@ data class ChatUiState(
     val generationError: String? = null,
     val apiTestResult: ApiTestResult? = null,
     val isTestingApi: Boolean = false,
+    /** 请求体预览（查看请求体功能），null = 不显示 */
+    val requestBodyPreview: String? = null,
     val editingTitle: String? = null,
     /** 待写入文件的备份 JSON（由 UI 端 SAF 写入后清除） */
     val exportPayload: String? = null,
@@ -285,6 +287,13 @@ class ChatViewModel(
     fun setContextLimitK(k: Int) {
         viewModelScope.launch {
             val config = _uiState.value.config.copy(contextLimitK = if (k <= 0) 0 else k.coerceIn(32, 256))
+            repository.saveConfig(config)
+        }
+    }
+
+    fun saveSshConfig(ssh: com.uchat.app.data.SshConfig) {
+        viewModelScope.launch {
+            val config = _uiState.value.config.copy(sshConfig = ssh)
             repository.saveConfig(config)
         }
     }
@@ -801,6 +810,25 @@ class ChatViewModel(
             val models = repository.fetchAvailableModels(editing)
             _uiState.update { it.copy(fetchingModels = false, availableModels = models) }
         }
+    }
+
+    /** 关闭模型选择弹窗（清空列表） */
+    fun clearAvailableModels() {
+        _uiState.update { it.copy(availableModels = emptyList()) }
+    }
+
+    /** 生成请求体预览（含自定义请求头），用于验证配置 */
+    fun previewRequestBody() {
+        val editing = _uiState.value.editingModel ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val preview = repository.previewRequestBody(editing)
+            _uiState.update { it.copy(requestBodyPreview = preview) }
+        }
+    }
+
+    /** 关闭请求体预览 */
+    fun clearRequestPreview() {
+        _uiState.update { it.copy(requestBodyPreview = null) }
     }
 
     // ── 导出聊天（文本格式） ─────────────────────────────────────

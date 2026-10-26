@@ -25,6 +25,9 @@ class ToolRegistry(private val context: Context) {
     /** 联网能力回调（web_search / fetch_page 由上层注入，复用内置证书信任） */
     var netOps: com.uchat.app.data.NetOps? = null
 
+    /** SSH 能力回调（ssh_execute 由上层注入，复用设置页配置的连接） */
+    var sshOps: com.uchat.app.data.SSHOps? = null
+
     /** 工具定义列表（随每个请求发给模型的 tools 数组） */
     val definitions: List<ToolDef> = listOf(
         ToolDef(
@@ -65,14 +68,14 @@ class ToolRegistry(private val context: Context) {
         ToolDef(
             id = "remember_memory",
             name = "remember_memory",
-            description = "把关于用户的重要信息（偏好、身份、习惯、事实）保存进长期记忆，跨会话有效。当用户明确说「记住…」、表达偏好、透露个人事实时调用。参数 content 为记忆内容（写成陈述句）。",
+            description = "把关于用户的重要信息（偏好、身份、习惯、长期事实）保存进长期记忆，跨会话有效。仅在出现值得长期记住的新信息时调用（用户明确说「记住…」、表达偏好、透露个人事实）；琐碎/一次性内容不要保存。",
             parameters = """{"type":"object","properties":{"content":{"type":"string","description":"要保存的记忆内容，如：用户喜欢简洁回答"},"importance":{"type":"string","enum":["low","normal","high"],"description":"重要程度，默认 normal"}},"required":["content"]}""",
             dangerLevel = 1
         ),
         ToolDef(
             id = "recall_memories",
             name = "recall_memories",
-            description = "检索长期记忆中关于用户的已知信息（偏好、身份、习惯、历史事实）。回答涉及用户个人化问题或需要回忆之前对话内容时先调用它，避免忘记用户之前说过的话。",
+            description = "检索长期记忆中关于用户的已知信息（偏好、身份、习惯、历史事实）。注意：系统已在上下文中自动注入最近记忆摘要，通常无需调用。仅在用户明确询问过去发生的事、或需要更早/更具体的跨会话信息时才调用；日常对话、简单问题直接回答，禁止先查记忆。确需查询时一次查清（用较宽泛的关键词），同一轮不要多次重复查询。",
             parameters = """{"type":"object","properties":{"query":{"type":"string","description":"检索关键词，如：偏好 或 工作"}},"required":["query"]}""",
             dangerLevel = 1
         ),
@@ -82,6 +85,13 @@ class ToolRegistry(private val context: Context) {
             description = "向用户发送一个文件，聊天中会展示为文件卡片供用户点击下载。用于把找到/生成的文件交付给用户：给出文件名（含扩展名）与可下载的 http(s) 地址（如 run_shell 中 wget 下载的文件，或你已知的直链）。文件类型由扩展名决定展示图标。",
             parameters = """{"type":"object","properties":{"name":{"type":"string","description":"文件名，需含扩展名，如 report.pdf 或 app.apk"},"url":{"type":"string","description":"文件的 http(s) 下载直链"}},"required":["name","url"]}""",
             dangerLevel = 1
+        ),
+        ToolDef(
+            id = "ssh_execute",
+            name = "ssh_execute",
+            description = "通过 SSH 连接用户在设置页配置的远程服务器，执行一条命令并返回输出（stdout/stderr）。用于查看远程服务器状态、管理文件、执行远程脚本等。连接参数（主机/端口/用户名/密码或私钥）在设置 → SSH 中配置；未配置或未启用时返回错误。命令不要包含交互式输入需求。",
+            parameters = """{"type":"object","properties":{"command":{"type":"string","description":"在远程服务器上执行的命令，如：uname -a 或 df -h 或 tail -n 20 /var/log/syslog"}},"required":["command"]}""",
+            dangerLevel = 3
         )
     )
 
@@ -155,6 +165,11 @@ class ToolRegistry(private val context: Context) {
                 !url.startsWith("http://") && !url.startsWith("https://") -> "错误：url 必须是 http(s) 下载直链"
                 else -> "【文件卡片】$name|$url"
             }
+        }
+        "ssh_execute" -> {
+            val command = parseArg(argumentsJson, "command").trim()
+            if (command.isBlank()) "错误：缺少参数 command"
+            else sshOps?.sshExecute(command) ?: "错误：SSH 工具未就绪"
         }
         else -> "错误：未知工具 $name"
     }

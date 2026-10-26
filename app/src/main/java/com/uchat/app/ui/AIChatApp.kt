@@ -81,6 +81,7 @@ import com.uchat.app.data.CodeBlock
 import com.uchat.app.data.MemoryEntry
 import com.uchat.app.data.ModelConfig
 import com.uchat.app.data.SendAttachment
+import com.uchat.app.data.SshConfig
 import com.uchat.app.data.TlsConfig
 import com.uchat.app.data.ToolCallData
 import com.uchat.app.data.extractMarkdownBlocks
@@ -2205,6 +2206,47 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
 
         Spacer(modifier = Modifier.height(10.dp))
 
+        // SSH 服务器配置（ssh_execute 工具）
+        Surface(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("SSH 服务器", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "配置后模型可通过 ssh_execute 工具连接远程服务器执行命令（危险等级 3，调用前需你确认）。密码与私钥二选一（私钥优先）。",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                var ssh by remember(uiState.config.sshConfig) { mutableStateOf(uiState.config.sshConfig) }
+                var portText by remember(uiState.config.sshConfig) { mutableStateOf(ssh.port.toString()) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = ssh.enabled, onCheckedChange = { ssh = ssh.copy(enabled = it) })
+                    Text("启用 SSH 工具", fontSize = 14.sp)
+                }
+                EditField("主机地址", ssh.host, { ssh = ssh.copy(host = it) }, placeholder = "192.168.1.10 或 example.com")
+                EditField("端口", portText, {
+                    portText = it
+                    it.toIntOrNull()?.let { p -> ssh = ssh.copy(port = p) }
+                }, placeholder = "22")
+                EditField("用户名", ssh.username, { ssh = ssh.copy(username = it) }, placeholder = "root")
+                EditField("密码", ssh.password, { ssh = ssh.copy(password = it) }, placeholder = "留空则用私钥认证", isPassword = true)
+                EditField("私钥（OpenSSH 格式）", ssh.privateKey, { ssh = ssh.copy(privateKey = it) }, placeholder = "-----BEGIN OPENSSH PRIVATE KEY-----", multiLine = true)
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = { onIntent(UiIntent.SaveSshConfig(ssh)) },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("保存 SSH 配置")
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
         Surface(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
@@ -2220,7 +2262,9 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
                     "web_search" to "联网搜索互联网（Firecrawl 免费额度，无需 API Key，失败自动降级 Keenable）",
                     "fetch_page" to "抓取公开网页正文（Markdown 截断，用于阅读搜索结果）",
                     "remember_memory" to "把关于用户的重要信息保存进长期记忆（跨会话有效）",
-                    "recall_memories" to "检索长期记忆中关于用户的已知信息"
+                    "recall_memories" to "检索长期记忆中关于用户的已知信息",
+                    "send_file" to "向用户发送文件（聊天中展示为文件卡片）",
+                    "ssh_execute" to "通过 SSH 连接已配置的远程服务器执行命令（需在设置页配置）"
                 ).forEach { (name, desc) ->
                     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                         Text("🔧 $name", fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
@@ -2606,7 +2650,48 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
         EditField("配置名称", model.name, { onIntent(UiIntent.UpdateEditingModel(model.copy(name = it))) }, placeholder = "例如：DeepSeek")
         EditField("API 地址", model.apiUrl, { onIntent(UiIntent.UpdateEditingModel(model.copy(apiUrl = it))) }, placeholder = "https://api.deepseek.com/v1")
         EditField("API Key", model.apiKey, { onIntent(UiIntent.UpdateEditingModel(model.copy(apiKey = it))) }, placeholder = "sk-xxxx...", isPassword = true)
-        EditField("模型名称", model.model, { onIntent(UiIntent.UpdateEditingModel(model.copy(model = it))) }, placeholder = "deepseek-chat")
+
+        // 模型名称 + 右侧 1:1 获取模型按钮（点击获取，弹出列表选择填入）
+        // 底部对齐：按钮(56dp)与输入框(56dp)等高，底边对齐即中心对齐，避免按钮偏低
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("模型名称", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = model.model,
+                    onValueChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(model = it))) },
+                    modifier = Modifier.fillMaxWidth().clipToBounds(),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    placeholder = { Text("deepseek-chat", fontSize = 14.sp) }
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        if (uiState.fetchingModels) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                    )
+                    .clickable(enabled = !uiState.fetchingModels && model.apiUrl.isNotBlank() && model.apiKey.isNotBlank()) {
+                        onIntent(UiIntent.FetchModels)
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                if (uiState.fetchingModels) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "获取模型列表",
+                        modifier = Modifier.size(22.dp),
+                        tint = if (model.apiUrl.isNotBlank() && model.apiKey.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+                    )
+                }
+            }
+        }
 
         // Temperature slider
         Column(modifier = Modifier.padding(vertical = 5.dp)) {
@@ -2622,6 +2707,28 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
 
         EditField("系统提示词", model.systemPrompt, { onIntent(UiIntent.UpdateEditingModel(model.copy(systemPrompt = it))) }, placeholder = "可选，设置 AI 的角色", multiLine = true)
 
+        // 自定义请求头 / 请求体：本地编辑列表，保存/测试/预览时同步回 model
+        var headerList by remember(model.id) { mutableStateOf(model.customHeaders.toList()) }
+        KeyValueEditor(
+            title = "自定义请求头",
+            subtitle = "附加到每次请求的 HTTP 请求头，如 Authorization、X-API-Key 等",
+            items = headerList,
+            keyPlaceholder = "请求头名",
+            valuePlaceholder = "值",
+            addLabel = "添加请求头",
+            onUpdate = { headerList = it }
+        )
+        var bodyList by remember(model.id) { mutableStateOf(model.customBodyParams.toList()) }
+        KeyValueEditor(
+            title = "自定义请求体",
+            subtitle = "附加到请求体 JSON 顶层的参数，可覆盖默认参数；值支持数字/布尔（如 max_tokens=2048）",
+            items = bodyList,
+            keyPlaceholder = "参数名",
+            valuePlaceholder = "值",
+            addLabel = "添加参数",
+            onUpdate = { bodyList = it }
+        )
+
         Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = model.stream,
@@ -2630,14 +2737,105 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
             Text("流式输出", fontSize = 14.sp)
         }
 
+        // 视觉模型
         Row(modifier = Modifier.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
-                checked = model.thinking,
-                onCheckedChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinking = it))) }
+                checked = model.vision,
+                onCheckedChange = { onIntent(UiIntent.UpdateEditingModel(model.copy(vision = it))) }
             )
             Column {
+                Text("视觉模型", fontSize = 14.sp)
+                Text("关闭时发送图片会转为沙箱文件形式交给模型处理", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        // 思考模式：自动识别 / 强制开启 / 关闭
+        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("深度思考", fontSize = 14.sp)
-                Text("启用 o1 系列模型的推理能力", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    if (model.thinkingPolicy == "auto") "自动识别：支持思考的模型自动启用" else "思考过程单独展示",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            SingleLineRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                listOf("auto" to "自动", "on" to "开启", "off" to "关闭").forEach { (mode, label) ->
+                    FilterChip(
+                        selected = model.thinkingPolicy == mode,
+                        onClick = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinkingPolicy = mode))) },
+                        label = { Text(label, fontSize = 11.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                        )
+                    )
+                }
+            }
+        }
+
+        // 思考格式 + 思考强度：仅"开启"时显示（自动/关闭均不干预思考参数，交给 API 决策）
+        if (model.thinkingPolicy == "on") {
+            Column(modifier = Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 6.dp)) {
+                Text("思考格式", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(6.dp))
+                SingleLineRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(
+                        "auto" to "自动",
+                        "deepseek" to "DeepSeek",
+                        "openai" to "OpenAI",
+                        "qwen" to "Qwen",
+                        "bool" to "布尔"
+                    ).forEach { (mode, label) ->
+                        FilterChip(
+                            selected = model.thinkingMode == mode,
+                            onClick = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinkingMode = mode))) },
+                            label = { Text(label, fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text("思考强度", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(6.dp))
+                SingleLineRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(
+                        "auto" to "自动",
+                        "low" to "低",
+                        "medium" to "中",
+                        "high" to "强"
+                    ).forEach { (eff, label) ->
+                        FilterChip(
+                            selected = model.thinkingEffort == eff,
+                            onClick = { onIntent(UiIntent.UpdateEditingModel(model.copy(thinkingEffort = eff))) },
+                            label = { Text(label, fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    "强度仅在 OpenAI / DeepSeek 等支持 reasoning_effort 的模型上生效",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                )
             }
         }
 
@@ -2645,7 +2843,22 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
         if (!uiState.isNewModel || model.apiKey.isNotBlank()) {
             Spacer(modifier = Modifier.height(8.dp))
             OutlinedButton(
-                onClick = { onIntent(UiIntent.TestApi) },
+                onClick = {
+                    // 测试前先把本地请求头列表同步进 model
+                    onIntent(
+                        UiIntent.UpdateEditingModel(
+                            model.copy(
+                                    customHeaders = headerList.mapNotNull { (hk, hv) ->
+                                        hk.trim().takeIf { it.isNotEmpty() }?.let { it to hv }
+                                    }.toMap(),
+                                    customBodyParams = bodyList.mapNotNull { (bk, bv) ->
+                                        bk.trim().takeIf { it.isNotEmpty() }?.let { it to bv }
+                                    }.toMap()
+                                )
+                        )
+                    )
+                    onIntent(UiIntent.TestApi)
+                },
                 modifier = Modifier.fillMaxWidth().height(44.dp),
                 shape = RoundedCornerShape(10.dp),
                 enabled = !uiState.isTestingApi && model.apiUrl.isNotBlank() && model.apiKey.isNotBlank()
@@ -2666,37 +2879,104 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
                 ApiTestResultRow(result)
             }
 
-            // 获取模型列表
+            // 查看请求体：预览将要发送的请求体与请求头（验证自定义请求头 / 思考参数）
             Spacer(modifier = Modifier.height(8.dp))
             OutlinedButton(
-                onClick = { onIntent(UiIntent.FetchModels) },
+                onClick = {
+                    // 预览前先把本地请求头列表同步进 model
+                    onIntent(
+                        UiIntent.UpdateEditingModel(
+                            model.copy(
+                                    customHeaders = headerList.mapNotNull { (hk, hv) ->
+                                        hk.trim().takeIf { it.isNotEmpty() }?.let { it to hv }
+                                    }.toMap(),
+                                    customBodyParams = bodyList.mapNotNull { (bk, bv) ->
+                                        bk.trim().takeIf { it.isNotEmpty() }?.let { it to bv }
+                                    }.toMap()
+                                )
+                        )
+                    )
+                    onIntent(UiIntent.PreviewRequestBody)
+                },
                 modifier = Modifier.fillMaxWidth().height(44.dp),
                 shape = RoundedCornerShape(10.dp),
-                enabled = !uiState.fetchingModels && model.apiUrl.isNotBlank() && model.apiKey.isNotBlank()
+                enabled = model.apiUrl.isNotBlank() && model.apiKey.isNotBlank()
             ) {
-                if (uiState.fetchingModels) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("获取中...")
-                } else {
-                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("获取模型列表")
-                }
+                Icon(Icons.Default.Code, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("查看请求体")
             }
+        }
 
-            if (uiState.availableModels.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("可用模型（点击填入）：", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(modifier = Modifier.height(4.dp))
-                uiState.availableModels.forEach { available ->
-                    FilterChip(
-                        selected = model.model == available,
-                        onClick = { onIntent(UiIntent.UpdateEditingModel(model.copy(model = available))) },
-                        label = { Text(available, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
-                    )
-                    Spacer(modifier = Modifier.height(2.dp))
+        // 模型选择弹窗：获取模型后弹出列表，选择即填入模型名称
+        if (uiState.availableModels.isNotEmpty()) {
+            AlertDialog(
+                onDismissRequest = { onIntent(UiIntent.ClearAvailableModels) },
+                title = { Text("选择模型") },
+                text = {
+                    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                        if (uiState.availableModels.isEmpty()) {
+                            Text("没有获取到模型", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            uiState.availableModels.forEach { available ->
+                                TextButton(
+                                    onClick = {
+                                        onIntent(UiIntent.UpdateEditingModel(model.copy(model = available)))
+                                        onIntent(UiIntent.ClearAvailableModels)
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        available,
+                                        fontSize = 13.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = {
+                    TextButton(onClick = { onIntent(UiIntent.ClearAvailableModels) }) { Text("取消") }
+                }
+            )
+        }
+
+        // 请求体预览弹窗
+        uiState.requestBodyPreview?.let { preview ->
+            Dialog(onDismissRequest = { onIntent(UiIntent.ClearRequestPreview) }) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    modifier = Modifier.fillMaxWidth().padding(16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "请求体预览",
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(onClick = { onIntent(UiIntent.ClearRequestPreview) }) {
+                                Icon(Icons.Default.Close, contentDescription = "关闭")
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            preview,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 400.dp)
+                                .verticalScroll(rememberScrollState())
+                        )
+                    }
                 }
             }
         }
@@ -2715,12 +2995,91 @@ fun ModelEditForm(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) {
                 }
             }
             Button(
-                onClick = { onIntent(UiIntent.SaveEditingModel) },
+                onClick = {
+                    // 保存前把本地请求头列表同步进 model
+                    onIntent(
+                        UiIntent.UpdateEditingModel(
+                            model.copy(
+                                    customHeaders = headerList.mapNotNull { (hk, hv) ->
+                                        hk.trim().takeIf { it.isNotEmpty() }?.let { it to hv }
+                                    }.toMap(),
+                                    customBodyParams = bodyList.mapNotNull { (bk, bv) ->
+                                        bk.trim().takeIf { it.isNotEmpty() }?.let { it to bv }
+                                    }.toMap()
+                                )
+                        )
+                    )
+                    onIntent(UiIntent.SaveEditingModel)
+                },
                 modifier = Modifier.weight(1f).height(48.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Text("保存")
             }
+        }
+    }
+}
+
+@Composable
+private fun KeyValueEditor(
+    title: String,
+    subtitle: String,
+    items: List<Pair<String, String>>,
+    keyPlaceholder: String,
+    valuePlaceholder: String,
+    addLabel: String,
+    onUpdate: (List<Pair<String, String>>) -> Unit
+) {
+    Spacer(modifier = Modifier.height(10.dp))
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(title, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))
+        Spacer(modifier = Modifier.height(4.dp))
+        items.forEachIndexed { index, (k, v) ->
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = k,
+                    onValueChange = { nk -> onUpdate(items.toMutableList().also { it[index] = nk to v }) },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    placeholder = { Text(keyPlaceholder, fontSize = 12.sp) },
+                    textStyle = TextStyle(fontSize = 12.sp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                OutlinedTextField(
+                    value = v,
+                    onValueChange = { nv -> onUpdate(items.toMutableList().also { it[index] = k to nv }) },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp),
+                    placeholder = { Text(valuePlaceholder, fontSize = 12.sp) },
+                    textStyle = TextStyle(fontSize = 12.sp)
+                )
+                IconButton(
+                    onClick = { onUpdate(items.filterIndexed { j, _ -> j != index }) },
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "删除",
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        }
+        TextButton(
+            onClick = { onUpdate(items + ("" to "")) },
+            modifier = Modifier.padding(top = 2.dp)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(addLabel, fontSize = 12.sp)
         }
     }
 }
@@ -2847,6 +3206,9 @@ sealed class UiIntent {
     data object CancelEditModel : UiIntent()
     data object DeleteEditingModel : UiIntent()
     data object FetchModels : UiIntent()
+    data object ClearAvailableModels : UiIntent()
+    data object PreviewRequestBody : UiIntent()
+    data object ClearRequestPreview : UiIntent()
     data object TestApi : UiIntent()
     data object ClearToast : UiIntent()
     data object ExportChats : UiIntent()
@@ -2868,6 +3230,7 @@ sealed class UiIntent {
     data class SetApprovalThreshold(val level: Int) : UiIntent()
     data class SetMaxAutoRounds(val rounds: Int) : UiIntent()
     data class SetContextLimitK(val k: Int) : UiIntent()
+    data class SaveSshConfig(val sshConfig: SshConfig) : UiIntent()
     data object LoadMemories : UiIntent()
     data class DeleteMemory(val id: String) : UiIntent()
     data object ClearMemories : UiIntent()

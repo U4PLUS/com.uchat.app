@@ -45,6 +45,9 @@ class MainActivity : ComponentActivity() {
                         is UiIntent.CancelEditModel -> { viewModel.cancelEditModel() }
                         is UiIntent.DeleteEditingModel -> { viewModel.deleteEditingModel() }
                         is UiIntent.FetchModels -> { viewModel.fetchModels() }
+                        is UiIntent.ClearAvailableModels -> { viewModel.clearAvailableModels() }
+                        is UiIntent.PreviewRequestBody -> { viewModel.previewRequestBody() }
+                        is UiIntent.ClearRequestPreview -> { viewModel.clearRequestPreview() }
                         is UiIntent.TestApi -> { viewModel.testApi() }
                         is UiIntent.ClearToast -> { viewModel.clearToast() }
                         is UiIntent.ExportChats -> { viewModel.exportChats() }
@@ -67,6 +70,7 @@ class MainActivity : ComponentActivity() {
                         is UiIntent.SetApprovalThreshold -> { viewModel.setApprovalThreshold(intent.level) }
                         is UiIntent.SetMaxAutoRounds -> { viewModel.setMaxAutoRounds(intent.rounds) }
                         is UiIntent.SetContextLimitK -> { viewModel.setContextLimitK(intent.k) }
+                        is UiIntent.SaveSshConfig -> { viewModel.saveSshConfig(intent.sshConfig) }
                         is UiIntent.LoadMemories -> { viewModel.loadMemories() }
                         is UiIntent.DeleteMemory -> { viewModel.deleteMemory(intent.id) }
                         is UiIntent.ClearMemories -> { viewModel.clearMemories() }

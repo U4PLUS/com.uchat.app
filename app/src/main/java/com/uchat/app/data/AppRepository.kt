@@ -1,6 +1,7 @@
 package com.uchat.app.data
 
 import android.content.Context
+import android.util.Base64
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
@@ -14,13 +15,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.sp
 import com.google.gson.Gson
+import com.google.gson.GsonBuilder
 import com.google.gson.reflect.TypeToken
+import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
@@ -39,9 +45,20 @@ data class ModelConfig(
     val temperature: Float = 0.7f,
     val systemPrompt: String = "",
     val stream: Boolean = true,
+    /** 深度思考（旧字段，仅迁移用）：true=开启；新版本用 thinkingPolicy */
     val thinking: Boolean = false,
+    /** 思考策略：auto=按模型自动识别启用 / on=始终开启 / off=始终关闭 */
+    val thinkingPolicy: String = "auto",
+    /** 思考强度：auto（按模型默认 high）/ low / medium / high */
+    val thinkingEffort: String = "auto",
+    /** 思考参数格式：auto=按模型名自动识别 / deepseek / openai / qwen / bool */
+    val thinkingMode: String = "auto",
+    /** 是否为视觉模型：true=图片以 image_url 多模态发送；false=图片转沙箱文件交给模型处理 */
+    val vision: Boolean = true,
     /** 附加到每次请求的自定义请求头（发消息 / 测试连接 / 获取模型列表） */
-    val customHeaders: Map<String, String> = emptyMap()
+    val customHeaders: Map<String, String> = emptyMap(),
+    /** 附加到请求体 JSON 顶层的自定义参数（键值，值自动识别数字/布尔/字符串），可覆盖默认参数 */
+    val customBodyParams: Map<String, String> = emptyMap()
 )
 
 data class AppConfig(
@@ -62,6 +79,21 @@ data class AppConfig(
     val maxAutoRounds: Int = 10,
     /** 上下文压缩阈值（k token，0 = 不压缩）：历史消息估算超过时，最旧部分用 AI 摘要压缩 */
     val contextLimitK: Int = 128,
+    /** SSH 服务器配置（ssh_execute 工具使用） */
+    val sshConfig: SshConfig = SshConfig(),
+)
+
+/** SSH 连接配置（模型通过 ssh_execute 工具连接远程服务器） */
+data class SshConfig(
+    /** 是否启用 SSH 工具 */
+    val enabled: Boolean = false,
+    val host: String = "",
+    val port: Int = 22,
+    val username: String = "",
+    /** 密码认证（与 privateKey 二选一，私钥优先） */
+    val password: String = "",
+    /** 私钥内容（OpenSSH 格式），留空则用密码认证 */
+    val privateKey: String = "",
 )
 
 data class ChatMessage(
@@ -134,6 +166,12 @@ interface NetOps {
     suspend fun webSearch(query: String, maxResults: Int): String
     /** 抓取公开网页正文（Firecrawl keyless scrape，Markdown 截断） */
     suspend fun fetchPage(url: String): String
+}
+
+/** SSH 能力回调：ssh_execute 由 AppRepository 实现（复用设置页配置的连接） */
+interface SSHOps {
+    /** 在已配置的 SSH 服务器上执行命令，返回 stdout/stderr 合并输出（截断 8000 字符） */
+    suspend fun sshExecute(command: String): String
 }
 
 data class CodeBlock(
@@ -291,8 +329,9 @@ private fun AnnotatedString.Builder.appendInlineRich(text: String, linkColor: Co
     return text.length
 }
 
-class AppRepository(private val context: Context) : MemoryOps, NetOps {
+class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps {
     private val gson = Gson()
+    private val prettyGson = GsonBuilder().setPrettyPrinting().create()
 
     /** 内置 ISRG Root X1 信任 + TLS1.2 的 SocketFactory（失败时回退系统默认） */
     private val sslSocketFactory: SSLSocketFactory? by lazy { TlsConfig.createSocketFactory(context) }
@@ -307,6 +346,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         val toolApprovalThreshold = intPreferencesKey("tool_approval_threshold_v2")
         val maxAutoRounds = intPreferencesKey("max_auto_rounds_v2")
         val contextLimitK = intPreferencesKey("context_limit_k_v2")
+        val sshConfig = stringPreferencesKey("ssh_config_v1")
         val memories = stringPreferencesKey("memories_v2")
         val chats = stringPreferencesKey("chats_v2")
     }
@@ -316,7 +356,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         val models: List<ModelConfig> = if (modelsJson != null) {
             try {
                 val type = object : TypeToken<List<ModelConfig>>() {}.type
-                gson.fromJson<List<ModelConfig>>(modelsJson, type)
+                normalizeModels(gson.fromJson<List<ModelConfig>>(modelsJson, type), modelsJson)
             } catch (_: Exception) { AppConfig().models }
         } else { AppConfig().models }
         val activeId = prefs[Keys.activeModelId] ?: models.firstOrNull()?.id ?: ""
@@ -327,10 +367,14 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         val threshold = prefs[Keys.toolApprovalThreshold] ?: 3
         val maxAutoRounds = prefs[Keys.maxAutoRounds] ?: 10
         val contextLimitK = prefs[Keys.contextLimitK] ?: 128
+        val sshJson = prefs[Keys.sshConfig]
+        val ssh = try {
+            gson.fromJson(sshJson, SshConfig::class.java) ?: SshConfig()
+        } catch (_: Exception) { SshConfig() }
         AppConfig(models = models, activeModelId = activeId, darkMode = dark,
                   messageFontSize = font, themeMode = themeMode, accentColor = accent,
                   toolApprovalThreshold = threshold, maxAutoRounds = maxAutoRounds,
-                  contextLimitK = contextLimitK)
+                  contextLimitK = contextLimitK, sshConfig = ssh)
     }
 
     val chatsFlow: Flow<Map<String, Chat>> = context.dataStore.data.map { prefs ->
@@ -339,6 +383,42 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
             val type = object : TypeToken<Map<String, Chat>>() {}.type
             gson.fromJson(chatsJson, type) ?: emptyMap()
         } catch (_: Exception) { emptyMap() }
+    }
+
+    /**
+     * 旧版本保存的模型配置 JSON 缺少后新增的非空字段时，Gson 反射反序列化会留下 null，
+     * 后续 model.copy(...) 触发非空校验 NPE。这里用反射检查并补齐默认值（绕过 Kotlin 非空类型系统）。
+     */
+    private fun normalizeModels(models: List<ModelConfig>, rawJson: String = ""): List<ModelConfig> {
+        // 旧数据没有 vision 字段时基本类型会反序列化为 false，需按原始 JSON 判断补 true（默认视觉）
+        val legacyNoVision = rawJson.isNotBlank() && !rawJson.contains("\"vision\"")
+        return models.map { m ->
+            var out = m
+            try {
+                // 所有字段先反射读出（as? 容错 null），最后一次性 copy，避免中间 copy 因其它字段为 null 抛 NPE
+                fun field(name: String): Any? {
+                    val f = ModelConfig::class.java.getDeclaredField(name).apply { isAccessible = true }
+                    return f.get(out)
+                }
+                val newMode = field("thinkingMode") as? String ?: "auto"
+                val oldThinking = field("thinking") as? Boolean
+                val newPolicy = field("thinkingPolicy") as? String ?: if (oldThinking == true) "on" else "auto"
+                val newEffort = field("thinkingEffort") as? String ?: "auto"
+                @Suppress("UNCHECKED_CAST")
+                val newHeaders = (field("customHeaders") as? Map<String, String>) ?: emptyMap()
+                @Suppress("UNCHECKED_CAST")
+                val newBody = (field("customBodyParams") as? Map<String, String>) ?: emptyMap()
+                out = out.copy(
+                    thinkingMode = newMode,
+                    thinkingPolicy = newPolicy,
+                    thinkingEffort = newEffort,
+                    customHeaders = newHeaders,
+                    customBodyParams = newBody,
+                    vision = if (legacyNoVision) true else out.vision
+                )
+            } catch (_: Throwable) {}
+            out
+        }
     }
 
     suspend fun saveConfig(config: AppConfig) {
@@ -352,6 +432,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
             prefs[Keys.toolApprovalThreshold] = config.toolApprovalThreshold
             prefs[Keys.maxAutoRounds] = config.maxAutoRounds
             prefs[Keys.contextLimitK] = config.contextLimitK
+            prefs[Keys.sshConfig] = gson.toJson(config.sshConfig)
         }
     }
 
@@ -551,6 +632,131 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
      * @param onChunk 流式增量回调（累计全文正文 + 思考过程）；非流式时仅回调一次
      * @param isCancelled 外部取消标志；content 为 null 表示请求被取消
      */
+    /** 把用户输入的自定义参数值转换为 JSON 类型：数字/布尔/JSON 字面量；无法解析则保持字符串 */
+    private fun parseJsonValue(v: String): Any {
+        val t = v.trim()
+        if (t.isEmpty()) return ""
+        return try {
+            gson.fromJson<Any>(t, Any::class.java) ?: ""
+        } catch (_: Exception) { t }
+    }
+
+    /**
+     * 计算本次请求要合并的思考参数（按思考策略）：
+     * on = 添加开启思考参数；off = 显式"关闭思考"参数（否则服务器默认可能自动开启思考）；
+     * auto = 不带任何思考参数，完全由 API 决定（与 off 一样不干预）。
+     */
+    private fun buildThinkingRequestParams(model: ModelConfig): Map<String, Any?> = when (model.thinkingPolicy) {
+        "on" -> buildThinkingParams(model)
+        "off" -> buildThinkingDisabledParams(model)
+        else -> emptyMap()
+    }
+
+    /**
+     * 显式关闭思考的参数（与 buildThinkingParams 同格式，取关闭值）：
+     * deepseek → thinking.type=disabled；qwen → enable_thinking=false；bool → thinking=false；
+     * openai 格式（o1/o3/gpt-5/claude 等）不支持显式关闭思考（API 限制），返回空参数交给服务器默认。
+     */
+    private fun buildThinkingDisabledParams(model: ModelConfig): Map<String, Any?> {
+        fun deepseek() = mapOf("thinking" to mapOf("type" to "disabled"))
+        fun qwen() = mapOf("enable_thinking" to false)
+        fun bool() = mapOf("thinking" to false)
+        return when (model.thinkingMode) {
+            "deepseek" -> deepseek()
+            "qwen" -> qwen()
+            "bool" -> bool()
+            "openai" -> emptyMap()
+            else -> {
+                val m = model.model.lowercase()
+                when {
+                    m.contains("deepseek") -> deepseek()
+                    m.contains("qwen") || m.contains("qwq") || m.contains("qwen3") -> qwen()
+                    m.contains("o1") || m.contains("o3") || m.contains("gpt-") || m.contains("claude") -> emptyMap()
+                    else -> bool()
+                }
+            }
+        }
+    }
+
+    /**
+     * 按模型生成开启思考的参数：兼容 DeepSeek / OpenAI / Qwen / 其他（布尔 thinking）。
+     * thinkingMode=auto 时按模型名识别，识别不到回退布尔格式（多数中转仍接受）。
+     * thinkingEffort：auto=high，低=low，中=medium，强=high。
+     */
+    private fun buildThinkingParams(model: ModelConfig): Map<String, Any?> {
+        val effort = when (model.thinkingEffort) {
+            "low" -> "low"
+            "medium" -> "medium"
+            "high" -> "high"
+            else -> "high"
+        }
+        fun deepseek() = mapOf("thinking" to mapOf("type" to "enabled"), "reasoning_effort" to effort)
+        fun openai() = mapOf("reasoning_effort" to effort)
+        fun qwen() = mapOf("enable_thinking" to true)
+        fun bool() = mapOf("thinking" to true)
+        return when (model.thinkingMode) {
+            "deepseek" -> deepseek()
+            "openai" -> openai()
+            "qwen" -> qwen()
+            "bool" -> bool()
+            else -> {
+                val m = model.model.lowercase()
+                when {
+                    m.contains("deepseek") -> deepseek()
+                    m.contains("qwen") || m.contains("qwq") || m.contains("qwen3") -> qwen()
+                    m.contains("o1") || m.contains("o3") || m.contains("gpt-") || m.contains("claude") -> openai()
+                    else -> bool()
+                }
+            }
+        }
+    }
+
+    /**
+     * 预览即将发送的请求（不发请求）：分段展示 请求地址 / 请求体 JSON（格式化）/ 请求头 / 自定义参数，
+     * 便于一眼核对自定义请求体、请求头与思考参数是否正确。
+     */
+    fun previewRequestBody(model: ModelConfig): String {
+        val body = linkedMapOf<String, Any?>(
+            "model" to model.model,
+            "messages" to listOf(
+                mapOf("role" to "system", "content" to "（系统提示词，发送时填入实际内容）"),
+                mapOf("role" to "user", "content" to "（你的消息）")
+            ),
+            "temperature" to model.temperature
+        )
+        if (model.stream) body["stream"] = true
+        buildThinkingRequestParams(model).forEach { (k, v) -> body[k] = v }
+        model.customBodyParams.forEach { (k, v) -> body[k] = parseJsonValue(v) }
+        val sb = StringBuilder()
+        // ① 请求地址
+        sb.append("【请求地址】\n")
+        sb.append("POST ").append(chatCompletionsEndpoint(model.apiUrl)).append("\n\n")
+        // ② 请求体 JSON（格式化）
+        sb.append("【请求体 JSON】\n")
+        sb.append(prettyGson.toJson(body)).append("\n\n")
+        // ③ 请求头
+        sb.append("【请求头】\n")
+        sb.append("Content-Type: application/json\n")
+        sb.append("Authorization: Bearer ").append(model.apiKey.take(12)).append(if (model.apiKey.length > 12) "…（隐藏）" else "").append("\n")
+        if (model.stream) sb.append("Accept: text/event-stream\n")
+        if (model.customHeaders.isEmpty()) {
+            sb.append("（无自定义请求头）\n")
+        } else {
+            model.customHeaders.forEach { (k, v) -> sb.append("$k: $v\n") }
+        }
+        sb.append("\n")
+        // ④ 自定义请求体参数
+        sb.append("【自定义请求体参数】\n")
+        if (model.customBodyParams.isEmpty()) {
+            sb.append("（无，仅使用默认参数）\n")
+        } else {
+            model.customBodyParams.forEach { (k, v) ->
+                sb.append("$k = $v").append("   →  已合并进上面的 JSON\n")
+            }
+        }
+        return sb.toString().trim()
+    }
+
     suspend fun sendMessage(
         config: AppConfig,
         messages: List<ChatMessage>,
@@ -614,7 +820,8 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         val hasUserText = textPart.isNotBlank() || images.isNotEmpty()
         if (images.isEmpty()) {
             if (textPart.isNotBlank()) msgList.add(mapOf("role" to "user", "content" to textPart))
-        } else {
+        } else if (model.vision) {
+            // 视觉模型：图片以 image_url 多模态嵌入
             val parts = mutableListOf<Map<String, Any?>>()
             parts.add(mapOf("type" to "text", "text" to textPart))
             images.forEach { img ->
@@ -624,6 +831,22 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
                 ))
             }
             msgList.add(mapOf("role" to "user", "content" to parts))
+        } else {
+            // 非视觉模型：图片无法直接发送，转存沙箱文件并描述给模型，模型可用 run_shell 等工具读取
+            val imgFiles = images.mapIndexed { i, img ->
+                val dir = File(context.filesDir, "toolbox/images").apply { mkdirs() }
+                val ext = when (img.mime) {
+                    "image/png" -> "png"; "image/jpeg" -> "jpg"; "image/webp" -> "webp"; "image/gif" -> "gif"
+                    else -> "img"
+                }
+                val f = File(dir, "img_${System.currentTimeMillis()}_$i.$ext")
+                try {
+                    f.writeBytes(Base64.decode(img.content, Base64.DEFAULT))
+                } catch (_: Exception) { f.writeBytes(img.content.toByteArray()) }
+                "【图片文件 ${i + 1}】${f.name}（沙箱路径 toolbox/images/${f.name}，大小 ${f.length() / 1024}KB，类型 ${img.mime}）"
+            }.joinToString("\n")
+            val desc = "$textPart\n\n用户发送了图片（当前模型为非视觉模型，未作为图片直接发送）：\n$imgFiles\n如需分析这些文件，可用 run_shell 等工具读取沙箱内文件。"
+            msgList.add(mapOf("role" to "user", "content" to desc))
         }
 
         // 流式 / 非流式由配置决定
@@ -648,9 +871,10 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
             }
             body["tool_choice"] = "auto"
         }
-        if (model.thinking) {
-            body["thinking"] = true
-        }
+        // 思考参数：on=开启 / off=显式关闭 / auto=按模型识别（识别不到不加）
+        buildThinkingRequestParams(model).forEach { (k, v) -> body[k] = v }
+        // 自定义请求体参数：合并到 body 顶层，覆盖同名默认参数
+        model.customBodyParams.forEach { (k, v) -> body[k] = parseJsonValue(v) }
 
         val requestBody = gson.toJson(body)
         val conn = openConnection(URL(chatCompletionsEndpoint(model.apiUrl))).apply {
@@ -754,7 +978,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
                             val delta = (((parsed["choices"] as? List<*>)?.getOrNull(0) as? Map<*, *>)?.get("delta") as? Map<*, *>) ?: emptyMap<String, Any?>()
                             val deltaContent = delta["content"] as? String
                             if (!deltaContent.isNullOrBlank()) content.append(deltaContent)
-                            val deltaReasoning = delta["reasoning"] as? String
+                            val deltaReasoning = (delta["reasoning"] as? String) ?: (delta["reasoning_content"] as? String)
                             if (!deltaReasoning.isNullOrBlank()) reasoning.append(deltaReasoning)
                             (delta["reasoning_details"] as? List<*>)?.forEach { part ->
                                 val text = (part as? Map<*, *>)?.get("text") as? String
@@ -797,7 +1021,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         val resp = gson.fromJson(body, Map::class.java)
         val message = ((resp["choices"] as? List<*>)?.getOrNull(0) as? Map<*, *>)?.get("message") as? Map<*, *>
         val content = message?.get("content") as? String ?: ""
-        val reasoning = message?.get("reasoning") as? String ?: ""
+        val reasoning = (message?.get("reasoning") as? String) ?: (message?.get("reasoning_content") as? String) ?: ""
         val calls = (message?.get("tool_calls") as? List<*>)?.mapNotNull { tc ->
             val m = tc as? Map<*, *> ?: return@mapNotNull null
             val fn = m["function"] as? Map<*, *> ?: return@mapNotNull null
@@ -878,6 +1102,9 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         append("5. 若工具返回错误，可修正参数重试一次；仍失败则如实告知用户\n")
         append("6. 全程使用简体中文回答\n")
         append("7. 回复支持 Markdown：展示图片用 ![描述](图片URL)，提供网页/文件下载链接用 [文字](https://…)，可放正文任意位置；网络图片可直接引用 URL\n")
+        append("8. 记忆纪律：系统已在上下文中自动注入最近记忆摘要，通常无需查询。仅当需要用户过去的信息（如\"我之前说过什么\"\"我的偏好\"\"上次聊的什么\"）时才调用 recall_memories；日常闲聊、简单提问直接回答，禁止为回答问题而先查记忆。确需回忆时一次查清，同一轮不要多次重复查询记忆\n")
+        append("9. 高效执行：能用已有信息回答就直接回答；不调用工具也能完成的简单任务不要调用工具；不要为了展示能力或流程完整而做多余动作，一切以最快满足用户当前需求为准\n")
+        append("10. 信息不足先提问：用户需求不明确、缺少关键信息（如要生成什么内容、目标细节、涉及哪个项目）时，先向用户提问澄清，再动手执行；不要臆测用户意图\n")
     }
 
     /**
@@ -957,6 +1184,78 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
         } catch (_: Exception) { emptyList() }
     }
 
+    /**
+     * SSH 工具实现：读取设置页配置的连接，执行远程命令并返回输出。
+     * 密码/私钥二选一（私钥优先）；连接/执行均带超时；输出截断 8000 字符。
+     */
+    override suspend fun sshExecute(command: String): String = withContext(Dispatchers.IO) {
+        val ssh = configFlow.first().sshConfig
+        if (!ssh.enabled) return@withContext "错误：SSH 工具未启用（请在设置 → SSH 中配置并启用）"
+        if (command.isBlank()) return@withContext "错误：缺少参数 command"
+        if (ssh.host.isBlank() || ssh.username.isBlank()) return@withContext "错误：SSH 配置不完整（缺少主机或用户名）"
+        if (ssh.privateKey.isBlank() && ssh.password.isBlank()) return@withContext "错误：SSH 未配置密码或私钥"
+        var session: Session? = null
+        try {
+            val jsch = JSch()
+            // Android 6（API 23）及部分老设备缺少 EC（椭圆曲线）算法的 JCE 实现
+            // （AlgorithmParameters EC not found），而 JSch 默认优先使用 ecdh-sha2-nistp* 密钥交换。
+            // 禁用 EC 密钥交换，改用 curve25519 / diffie-hellman 系列（同样安全、纯 Java 实现，老设备可用）。
+            JSch.setConfig(
+                "kex",
+                "curve25519-sha256,curve25519-sha256@libssh.org," +
+                    "diffie-hellman-group16-sha512,diffie-hellman-group15-sha512," +
+                    "diffie-hellman-group14-sha256,diffie-hellman-group14-sha1," +
+                    "diffie-hellman-group-exchange-sha256,diffie-hellman-group-exchange-sha1," +
+                    "diffie-hellman-group1-sha1"
+            )
+            if (ssh.privateKey.isNotBlank()) {
+                jsch.addIdentity("uchat_ssh_key", ssh.privateKey.toByteArray(), null, null)
+            }
+            session = jsch.getSession(ssh.username, ssh.host, ssh.port).apply {
+                if (ssh.privateKey.isBlank()) setPassword(ssh.password)
+                setConfig("StrictHostKeyChecking", "no")
+                setConfig("PreferredAuthentications", if (ssh.privateKey.isNotBlank()) "publickey,password" else "password,keyboard-interactive")
+                timeout = 15_000
+                connect(15_000)
+            }
+            val channel = session.openChannel("exec") as ChannelExec
+            channel.setCommand(command)
+            val out = StringBuilder()
+            val err = StringBuilder()
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+            try {
+                executor.submit {
+                    try { out.append(channel.inputStream.readBytes().toString(Charsets.UTF_8)) } catch (_: Exception) {}
+                }
+                executor.submit {
+                    try { err.append(channel.errStream.readBytes().toString(Charsets.UTF_8)) } catch (_: Exception) {}
+                }
+                channel.connect()
+                var waited = 0
+                while (!channel.isClosed && waited < 30_000) {
+                    Thread.sleep(200); waited += 200
+                }
+                if (waited >= 30_000) {
+                    channel.disconnect(); session.disconnect(); session = null
+                    return@withContext "错误：SSH 命令执行超时（30 秒）"
+                }
+                executor.shutdown()
+                executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)
+                val stdout = out.toString().trim()
+                val stderr = err.toString().trim()
+                val result = if (stderr.isNotBlank()) "$stdout\n[stderr] $stderr" else stdout
+                (if (result.isBlank()) "（命令执行完成，无输出）" else result).take(8000)
+            } finally {
+                try { channel.disconnect() } catch (_: Exception) {}
+                executor.shutdownNow()
+            }
+        } catch (e: Exception) {
+            "错误：SSH 执行失败 —— ${e.message ?: e.javaClass.simpleName}"
+        } finally {
+            try { session?.disconnect() } catch (_: Exception) {}
+        }
+    }
+
     /** 测试 API 连接（使用传入的模型配置，而非已保存的配置） */
     suspend fun testApiConnection(model: ModelConfig): ApiTestResult = withContext(Dispatchers.IO) {
         if (model.apiUrl.isBlank()) return@withContext ApiTestResult(false, "API 地址为空")
@@ -1011,7 +1310,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps {
             val backup = gson.fromJson(json, BackupData::class.java)
             val config = backup.config ?: return@withContext false
             val chats = backup.chats ?: return@withContext false
-            saveConfig(config)
+            saveConfig(config.copy(models = normalizeModels(config.models)))
             saveChats(chats)
             true
         } catch (_: Exception) { false }

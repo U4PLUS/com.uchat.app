@@ -12,8 +12,8 @@ android {
         applicationId = "com.uchat.app"
         minSdk = 21
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
     }
 
     buildTypes {
@@ -58,6 +58,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.google.code.gson:gson:2.11.0")
+    implementation("com.github.mwiede:jsch:0.2.16")
+    // 老设备（Android <8）JCE 缺少 EC 椭圆曲线实现，SSH 密钥交换/签名需要 BouncyCastle 兜底
+    implementation("org.bouncycastle:bcprov-jdk15on:1.70")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

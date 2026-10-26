@@ -2,6 +2,7 @@ package com.uchat.app
 
 import android.app.Application
 import android.content.Intent
+import android.os.Build
 import com.uchat.app.data.AppRepository
 import com.uchat.app.tools.ToolRegistry
 import java.io.File
@@ -20,10 +21,20 @@ class AIChatApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // Android 6-7（API < 26）的 JCE 缺少 EC 椭圆曲线算法实现（AlgorithmParameters EC not found），
+        // SSH 密钥交换与 ECDSA 签名会失败。注册 BouncyCastle provider 兜底（新设备 Conscrypt 已支持，不注册以免干扰）。
+        if (Build.VERSION.SDK_INT < 26) {
+            try {
+                if (java.security.Security.getProvider("BC") == null) {
+                    java.security.Security.addProvider(org.bouncycastle.jce.provider.BouncyCastleProvider())
+                }
+            } catch (_: Exception) {}
+        }
         repository = AppRepository(this)
         toolRegistry = ToolRegistry(this).apply {
             memoryOps = repository
             netOps = repository
+            sshOps = repository
         }
         // 崩溃处理：写 crash.log → 启动应用内崩溃页（显示堆栈/复制/重启），不弹系统闪退窗
         // 防循环：60 秒内崩溃超过 3 次则交给系统默认处理（避免崩溃页反复崩）

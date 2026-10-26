@@ -1,3 +1,26 @@
+# AI Chat v1.2.0（2026-10-26 发布）
+
+> 基线：v1.1.0（ed9798e）。本版本累计未提交功能已全部合入并发布。
+
+## 视觉模型标注
+- 模型编辑页新增「视觉模型」开关（默认开启）：开启 = 图片以 `image_url` 多模态发送；关闭 = 图片转为**沙箱文件**（`toolbox/images/`）并以文件描述交给模型，模型可用 `run_shell` 等工具读取处理；
+- 旧配置自动按视觉模型处理（历史 JSON 无该字段时默认 true）。
+
+## SSH 工具
+- 新增 `ssh_execute` 工具（危险等级 3，调用前需用户确认）：模型可通过 SSH 连接远程服务器执行命令，返回 stdout/stderr 合并输出（30s 超时、8000 字符截断）；
+- 设置 → Agent 工具新增「SSH 服务器」配置卡片：启用开关 + 主机/端口/用户名 + 密码与私钥二选一（私钥优先，OpenSSH 格式）；
+- 基于 com.github.mwiede:jsch:0.2.16；R8 下完整保留 JSch 反射加载类并抑制可选依赖（jna/log4j/bc/slf4j/jgss/junixsocket）。
+
+## 老设备（Android <8）SSH 兼容
+- 引入 org.bouncycastle:bcprov-jdk15on:1.70，应用启动时在 Android <8 设备注册 BouncyCastle provider，补齐缺失的 EC 椭圆曲线算法（AlgorithmParameters EC not found）；
+- 密钥交换禁用 EC 算法，改用 curve25519 / diffie-hellman 系列。
+
+## 思考策略重构
+- **关闭思考**：显式发送关闭参数（deepseek → thinking.type=disabled；qwen → enable_thinking=false；其他 → thinking=false），避免服务器默认自动开启思考（o1/o3/gpt-5/claude 等 OpenAI 格式不支持显式关闭，交服务器默认）；
+- **自动**：与关闭一样**不携带任何思考参数**，完全由 API 决策；模型编辑页仅「开启」时显示思考格式/思考强度设置。
+
+---
+
 # 最新变更（2026-10-22）
 
 > 基线：v1.0.0 正式版（906bb7e）
@@ -227,3 +250,43 @@ application-label: AI Chat
 ## Markdown 图片按原位渲染 + send_file 文件卡片（2026-10-23）
 - **图片原位展示**：`![描述](url)` 不再统一堆到消息末尾，改为在 markdown 语法所在位置原地渲染（文本流中图片前后内容与图片交错显示）；markdown 文件链接同样原位渲染；
 - **send_file 工具**：AI 可调用 `send_file(name, url)` 发送文件，聊天中展示为**横 4:1 文件卡片**——左侧 1:1 文件类型图标（按扩展名配色：PDF/ZIP/APK/DOC/XLS/PPT/IMG/MED/TXT/APP 等）+ 名称；点击卡片提示「开始下载」并用系统下载器下载到「下载」目录（通知栏显示进度，无需存储权限）。
+
+## 自定义请求头（2026-10-23）
+- 模型添加/编辑页新增「自定义请求头」：可添加任意多组 请求头名 → 值（行内编辑、可删除），点击「测试连接」「保存」自动同步；
+- 附加到该模型的**每次请求**（发消息 / 测试连接 / 获取模型列表），用于需要额外鉴权头、溯源头等场景（如 Authorization、X-API-Key）。
+
+## 模型设置页：获取模型按钮改版 + 请求体预览（2026-10-23）
+- 「获取模型列表」按钮移到**模型名称输入框右侧**（1:1 方形按钮）：点击获取，**弹出列表选择模型**，选中即填入模型名称；
+- 原按钮位置改为「**查看请求体**」：弹出预览弹窗，展示将发送的请求体 JSON（含 thinking 参数）与实际请求头（Authorization 打码 + 自定义请求头），可验证自定义请求头配置是否正确；
+- **修复**：旧版本保存的模型配置缺少新增字段（thinkingMode/customHeaders）时 Gson 反序列化为 null，导致编辑模型时 `ModelConfig.copy` 崩溃 NPE——加载配置与导入备份时自动补齐默认值。
+
+## 深度思考自动识别 + 思考强度（2026-10-23）
+- 「深度思考」改为三态：**自动**（按模型名自动识别是否支持思考，支持则自动启用）/ **开启** / **关闭**；
+- 新增「**思考强度**」：自动 / 低 / 中 / 强（reasoning_effort：low/medium/high，自动=high），仅 OpenAI/DeepSeek 等支持 reasoning_effort 的模型生效；
+- 旧版本数据自动迁移：老"深度思考"勾选 → 强制开启，未勾选 → 自动识别；
+- 模型设置页「获取模型列表」按钮与模型名称输入框改为底部对齐（按钮与输入框等高 56dp），消除按钮偏低偏差。
+- **修复崩溃**：旧配置同时缺少 thinkingPolicy/thinkingEffort 等多个新增字段时，字段补全逻辑因中途 copy 触发 NPE 而失效，导致选择思考强度崩溃——改为反射读取全部字段后一次性 copy 补全。
+
+## 自定义请求体 + 预览规范化（2026-10-23）
+- 新增「**自定义请求体**」：模型设置页可添加参数名/值，合并到请求体 JSON 顶层，可覆盖默认参数；值自动识别数字/布尔/JSON（如 max_tokens=2048、top_p=0.9），无法解析则按字符串；
+- 「自定义请求头」保留（仍附加 HTTP 请求头，两个功能并存）；
+- 「查看请求体」预览规范化：分段展示【请求地址】/【请求体 JSON】（缩进格式化）/【请求头】（Authorization 打码）/【自定义请求体参数】（标注已合并进 JSON），一眼可读；
+- 编辑 UI 抽公共组件 KeyValueEditor（请求头/请求体共用）。
+
+## Prompt 优化：记忆纪律 + 高效执行 + 主动澄清（2026-10-23）
+- Agent 系统提示词新增规则：
+  - 记忆纪律：上下文已自动注入最近记忆摘要，日常闲聊/简单提问直接回答，禁止为回答而先查记忆；确需回忆一次查清，同一轮不重复查询；
+  - 高效执行：能用已有信息回答就直接回答，简单任务不调用工具，不做多余动作；
+  - 信息不足先提问：需求不明确、缺关键信息时先向用户提问澄清，不臆测意图；
+- 记忆工具描述强化：remember_memory 只保存值得长期记住的内容（不存琐碎）；recall_memories 注明"系统已注入记忆摘要、通常无需调用、禁止重复查询"。
+
+## 视觉模型标注 + SSH 工具（2026-10-25）
+- 模型编辑页新增「**视觉模型**」开关（默认开启）：开启=图片以 image_url 多模态发送；关闭=图片转为**沙箱文件**（存 toolbox/images/）并以文件描述交给模型，模型可用 run_shell 等工具读取处理（旧配置自动按视觉模型处理）；
+- 新增 **SSH 工具**（ssh_execute，危险等级 3，调用需确认）：模型可通过 SSH 连接远程服务器执行命令并返回输出（stdout/stderr 合并、超时 30s、输出截断 8000 字符）；
+- 设置 → Agent 工具新增「**SSH 服务器**」配置卡片：启用开关 + 主机/端口/用户名 + 密码与私钥二选一（私钥优先，OpenSSH 格式），保存后工具即可使用；
+- 新增依赖 com.github.mwiede:jsch:0.2.16。
+- **修复 SSH 崩溃**：release 构建 R8 混淆把 JSch 通过字符串类名反射加载的 jce 实现（如 com.jcraft.jsch.jce.Random）当作未使用类删除，导致 SSH 执行报 ClassNotFoundException——proguard 规则新增保留 com.jcraft.jsch.jce.** 与 jcraft.**（不整包 keep，避免连带保留 Windows 专用 PageantConnector 及其缺失的 com.sun.jna 依赖）。
+- **修复 Android 6 老设备 SSH 失败**（AlgorithmParameters EC not found）：Android 6/部分老设备缺少 EC 椭圆曲线 JCE 实现，JSch 默认优先的 ecdh-sha2-nistp* 密钥交换无法初始化——已禁用 EC 密钥交换，改用 curve25519-sha256 / diffie-hellman-group14-18 系列（同样安全、纯 Java 实现，老设备可用）。
+- **修复 Android 6 老设备 SSH 仍报 EC 缺失**（根因：Android <8 的 JCE 没有 EC 椭圆曲线实现，任何 EC 相关初始化都抛 AlgorithmParameters EC not found）——引入 org.bouncycastle:bcprov-jdk15on:1.70，应用启动时在 Android <8 设备注册 BouncyCastle provider 兜底 EC 算法；proguard 完整保留 bcprov。
+- **修复"关闭思考"无效**：之前 off 只是不添加思考参数，服务器默认仍会开启思考——现在 off 会**显式发送关闭思考参数**（deepseek → thinking.type=disabled；qwen → enable_thinking=false；其他 → thinking=false；o1/o3/gpt-5/claude 等 OpenAI 格式不支持显式关闭，交给服务器默认）；auto 维持不加参数（按模型自动识别开启，识别不到交服务器默认）。
+- **思考策略"自动"改为完全交 API 决策**：自动时与关闭一样不添加任何思考参数（删除了原先按模型名自动添加开启参数的逻辑），且模型编辑页仅"开启"时才显示思考格式/思考强度设置（自动/关闭均隐藏，不干预）。
