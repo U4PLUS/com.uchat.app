@@ -62,7 +62,7 @@ class TermuxRuntime(private val context: Context) {
 
     /**
      * 安装 Termux 环境：
-     * - Android 8+：从内置 assets（termux-bootstrap/<abi>.bin，apt-android-7 变体）直接解包，离线可用；
+     * - Android 8+：从 lib/ 安装区（nativeLibraryDir/libtermux-bootstrap.so，apt-android-7 变体）直接解包，离线可用；
      * - Android 5-7：老设备兼容变体（apt-android-5，interpreter=/system/bin/linker）运行时下载后解包。
      */
     suspend fun install() {
@@ -132,6 +132,10 @@ class TermuxRuntime(private val context: Context) {
             // 6) 校验
             val bash = File(target, "bin/bash")
             if (!bash.isFile || !bash.canExecute()) throw Exception("Termux 环境校验失败（bash 不可执行）")
+
+            // 7) 确保 home/tmp 存在（pty 终端会话工作目录，缺失会导致 bash 无法启动）
+            home.mkdirs()
+            File(target, "tmp").mkdirs()
 
             // 清理缓存
             apkCache.delete(); soTmp.delete()
@@ -224,8 +228,19 @@ class TermuxRuntime(private val context: Context) {
         "TERMUX_IS_DEBUGGABLE_BUILD=0"
     )
 
-    /** 从内置 assets 复制本机 ABI 的 bootstrap 到缓存文件（返回是否成功） */
+    /**
+     * 复制本机 ABI 的 bootstrap 到缓存文件（返回是否成功）。
+     * 优先读取 lib/ 安装区（nativeLibraryDir，系统安装器提取的权威可执行区域，与 libbusybox.so 同机制），
+     * 回退内置 assets（旧版 APK 布局兼容）。
+     */
     private fun extractFromAssets(target: File): Boolean {
+        try {
+            val libSo = File(context.applicationInfo.nativeLibraryDir, "libtermux-bootstrap.so")
+            if (libSo.isFile && libSo.length() > 0) {
+                libSo.copyTo(target, overwrite = true)
+                if (target.length() > 0) return true
+            }
+        } catch (_: Exception) {}
         return try {
             context.assets.open("termux-bootstrap/${abiOf()}.bin").use { input ->
                 target.outputStream().use { out -> input.copyTo(out) }

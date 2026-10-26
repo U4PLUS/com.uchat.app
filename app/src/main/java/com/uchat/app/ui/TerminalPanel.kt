@@ -1,5 +1,6 @@
 package com.uchat.app.ui
 
+import java.io.File
 import android.graphics.Color
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -114,6 +115,9 @@ fun TerminalPanel(onClose: () -> Unit, termuxRuntime: TermuxRuntime) {
                     addOnLayoutChangeListener { v, l, t, r, b, ol, ot, or, ob ->
                         if (!attached && (l != ol || t != ot || r != or || b != ob)) {
                             attached = true
+                            // 会话工作目录必须存在，否则 pty 子进程 chdir 失败 → bash 无法 exec（报"目录不存在"）
+                            termuxRuntime.home.mkdirs()
+                            File(termuxRuntime.prefix, "tmp").mkdirs()
                             val bash = termuxRuntime.prefix.absolutePath + "/bin/bash"
                             val env = termuxRuntime.envArray()
                             val session = TerminalSession(
