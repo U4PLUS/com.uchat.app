@@ -4,12 +4,15 @@ package com.uchat.app.ui
 
 import android.app.DownloadManager
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.widget.Toast
@@ -62,6 +65,7 @@ import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.AnnotatedString
 import java.io.File
+import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
@@ -1625,22 +1629,112 @@ private sealed interface ImgUiState {
     data object Failed : ImgUiState
 }
 
-/** 大图查看对话框：点击任意处关闭 */
+/** 大图查看对话框：点击关闭，长按保存到相册 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ImageViewerDialog(bitmap: Bitmap, alt: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
     Dialog(onDismissRequest = onDismiss) {
         Box(
-            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color.Black).clickable { onDismiss() },
+            modifier = Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black)
+                .combinedClickable(
+                    onClick = onDismiss,
+                    onLongClick = {
+                        Toast.makeText(context, saveBitmapToGallery(context, bitmap), Toast.LENGTH_SHORT).show()
+                    }
+                ),
             contentAlignment = Alignment.Center
         ) {
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = alt,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxWidth().padding(8.dp)
-            )
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = alt,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "点击关闭 · 长按保存到相册",
+                    fontSize = 11.sp,
+                    color = Color.White.copy(alpha = 0.65f)
+                )
+            }
         }
     }
+}
+
+/**
+ * 保存位图到设备相册，返回结果提示文本（主线程调用）。
+ * - Android 10+（API 29+）：MediaStore 写入，免存储权限；
+ * - Android 9 及以下：写外部 Pictures/UChat；无写权限时降级到 App 私有外置目录。
+ */
+private fun saveBitmapToGallery(context: Context, bmp: Bitmap): String {
+    val name = "uchat_" + System.currentTimeMillis() + ".png"
+    val result = try {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val resolver = context.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/UChat")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) {
+                "保存失败：无法创建相册条目"
+            } else {
+                var ok = false
+                try {
+                    resolver.openOutputStream(uri)?.use { os ->
+                        bmp.compress(Bitmap.CompressFormat.PNG, 100, os)
+                        os.flush()
+                    }
+                    ok = true
+                } catch (_: Exception) {}
+                if (!ok) "保存失败：无法写入相册"
+                else {
+                    resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+                    "已保存到相册 Pictures/UChat/$name"
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "UChat").apply { mkdirs() }
+            val target = File(dir, name)
+            var wrote = false
+            try {
+                FileOutputStream(target).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                wrote = target.exists() && target.length() > 0
+            } catch (_: Exception) {}
+            if (wrote) {
+                "已保存到 Pictures/UChat/$name"
+            } else {
+                // 无写外部存储权限 → 降级到 App 私有外置目录（不进相册，文件管理器可看）
+                val fallback = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "UChat").apply { mkdirs() }
+                val ft = File(fallback, name)
+                var f2 = false
+                try {
+                    FileOutputStream(ft).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    f2 = ft.exists() && ft.length() > 0
+                } catch (_: Exception) {}
+                if (f2) "已保存（无相册权限，存于 App 私有目录 ${fallback.absolutePath}）"
+                else "保存失败：无可用存储位置"
+            }
+        }
+    } catch (e: Exception) {
+        "保存失败：${e.message ?: "未知错误"}"
+    }
+    // Android 9 及以下需通知媒体扫描器，图片才会出现在相册
+    if (Build.VERSION.SDK_INT < 29 && result.startsWith("已保存到 Pictures")) {
+        try {
+            @Suppress("DEPRECATION")
+            val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "UChat/$name")
+            context.sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.parse("file://" + file.absolutePath)))
+        } catch (_: Exception) {}
+    }
+    return result
 }
 
 /** markdown 文件链接块：[name](file.ext) → 可点击文件行（浏览器/系统打开） */
