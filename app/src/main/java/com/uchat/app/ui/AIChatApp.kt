@@ -2300,6 +2300,41 @@ private fun AgentTabContent(uiState: ChatUiState, onIntent: (UiIntent) -> Unit) 
 
         Spacer(modifier = Modifier.height(10.dp))
 
+        // 生图配置（generate_image / generate_image_edit 工具）
+        Surface(
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("生图配置", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "配置后模型可通过 generate_image（文生图）/ generate_image_edit（图生图）工具生成图片。默认对接 gpt-image-2，按 token 计费。",
+                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                var img by remember(uiState.config.imageGenConfig) { mutableStateOf(uiState.config.imageGenConfig) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = img.enabled, onCheckedChange = { img = img.copy(enabled = it) })
+                    Text("启用生图工具", fontSize = 14.sp)
+                }
+                EditField("API 地址（含 /v1）", img.baseUrl, { img = img.copy(baseUrl = it) }, placeholder = "https://zzz.1145.lol/v1")
+                EditField("API Key", img.apiKey, { img = img.copy(apiKey = it) }, placeholder = "sk-...", isPassword = true)
+                EditField("默认尺寸", img.defaultSize, { img = img.copy(defaultSize = it) }, placeholder = "1024x1024")
+                EditField("默认质量", img.defaultQuality, { img = img.copy(defaultQuality = it) }, placeholder = "low / medium / high")
+                EditField("默认数量（1-4）", img.defaultCount.toString(), { v -> v.toIntOrNull()?.let { img = img.copy(defaultCount = it.coerceIn(1, 4)) } }, placeholder = "1")
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = { onIntent(UiIntent.SaveImageGenConfig(img)) },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(10.dp)
+                ) { Text("保存生图配置") }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
         // SSH 服务器配置（ssh_execute 工具）
         Surface(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
@@ -3325,6 +3360,7 @@ sealed class UiIntent {
     data class SetMaxAutoRounds(val rounds: Int) : UiIntent()
     data class SetContextLimitK(val k: Int) : UiIntent()
     data class SaveSshConfig(val sshConfig: SshConfig) : UiIntent()
+    data class SaveImageGenConfig(val config: com.uchat.app.data.ImageGenConfig) : UiIntent()
     data object LoadMemories : UiIntent()
     data class DeleteMemory(val id: String) : UiIntent()
     data object ClearMemories : UiIntent()

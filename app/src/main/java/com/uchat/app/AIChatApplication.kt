@@ -35,6 +35,7 @@ class AIChatApplication : Application() {
             memoryOps = repository
             netOps = repository
             sshOps = repository
+            imageGenOps = repository
         }
         // 崩溃处理：写 crash.log → 启动应用内崩溃页（显示堆栈/复制/重启），不弹系统闪退窗
         // 防循环：60 秒内崩溃超过 3 次则交给系统默认处理（避免崩溃页反复崩）

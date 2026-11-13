@@ -298,6 +298,13 @@ class ChatViewModel(
         }
     }
 
+    fun saveImageGenConfig(cfg: com.uchat.app.data.ImageGenConfig) {
+        viewModelScope.launch {
+            val config = _uiState.value.config.copy(imageGenConfig = cfg)
+            repository.saveConfig(config)
+        }
+    }
+
     // ── 自动重试：网络/5xx 错误最多重试 10 次，每次间隔 5 秒，UI 显示错误消息 ──
 
     private fun isRetryable(e: Exception): Boolean {

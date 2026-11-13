@@ -2,6 +2,7 @@ package com.uchat.app.data
 
 import android.content.Context
 import android.util.Base64
+import org.json.JSONObject
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
@@ -26,10 +27,12 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLSocketFactory
@@ -81,6 +84,8 @@ data class AppConfig(
     val contextLimitK: Int = 128,
     /** SSH 服务器配置（ssh_execute 工具使用） */
     val sshConfig: SshConfig = SshConfig(),
+    /** 生图配置（generate_image / generate_image_edit 工具使用） */
+    val imageGenConfig: ImageGenConfig = ImageGenConfig(),
 )
 
 /** SSH 连接配置（模型通过 ssh_execute 工具连接远程服务器） */
@@ -94,6 +99,22 @@ data class SshConfig(
     val password: String = "",
     /** 私钥内容（OpenSSH 格式），留空则用密码认证 */
     val privateKey: String = "",
+)
+
+/** 生图配置（gpt-image-2 文生图 / 图生图） */
+data class ImageGenConfig(
+    /** 是否启用生图工具 */
+    val enabled: Boolean = true,
+    /** API base URL（含 /v1） */
+    val baseUrl: String = "https://zzz.1145.lol/v1",
+    /** API Key */
+    val apiKey: String = "",
+    /** 默认尺寸，如 1024x1024 */
+    val defaultSize: String = "1024x1024",
+    /** 默认质量：low / medium / high */
+    val defaultQuality: String = "medium",
+    /** 默认生成数量（1-4） */
+    val defaultCount: Int = 1,
 )
 
 data class ChatMessage(
@@ -172,6 +193,14 @@ interface NetOps {
 interface SSHOps {
     /** 在已配置的 SSH 服务器上执行命令，返回 stdout/stderr 合并输出（截断 8000 字符） */
     suspend fun sshExecute(command: String): String
+}
+
+/** 生图能力回调（generate_image / generate_image_edit 由上层注入，复用设置页生图配置） */
+interface ImageGenOps {
+    /** 文生图：返回 markdown 图片引用或错误文本 */
+    suspend fun generateImage(prompt: String, size: String, quality: String, n: Int): String
+    /** 图生图：imageRef 为 http(s) 直链 / file:// 本地路径 / data:base64 */
+    suspend fun editImage(prompt: String, imageRef: String, size: String, quality: String, n: Int): String
 }
 
 data class CodeBlock(
@@ -329,7 +358,7 @@ private fun AnnotatedString.Builder.appendInlineRich(text: String, linkColor: Co
     return text.length
 }
 
-class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps {
+class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps, ImageGenOps {
     private val gson = Gson()
     private val prettyGson = GsonBuilder().setPrettyPrinting().create()
 
@@ -347,6 +376,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps {
         val maxAutoRounds = intPreferencesKey("max_auto_rounds_v2")
         val contextLimitK = intPreferencesKey("context_limit_k_v2")
         val sshConfig = stringPreferencesKey("ssh_config_v1")
+        val imageGenConfig = stringPreferencesKey("image_gen_config_v1")
         val memories = stringPreferencesKey("memories_v2")
         val chats = stringPreferencesKey("chats_v2")
     }
@@ -371,10 +401,14 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps {
         val ssh = try {
             gson.fromJson(sshJson, SshConfig::class.java) ?: SshConfig()
         } catch (_: Exception) { SshConfig() }
+        val imgJson = prefs[Keys.imageGenConfig]
+        val img = try {
+            gson.fromJson(imgJson, ImageGenConfig::class.java) ?: ImageGenConfig()
+        } catch (_: Exception) { ImageGenConfig() }
         AppConfig(models = models, activeModelId = activeId, darkMode = dark,
                   messageFontSize = font, themeMode = themeMode, accentColor = accent,
                   toolApprovalThreshold = threshold, maxAutoRounds = maxAutoRounds,
-                  contextLimitK = contextLimitK, sshConfig = ssh)
+                  contextLimitK = contextLimitK, sshConfig = ssh, imageGenConfig = img)
     }
 
     val chatsFlow: Flow<Map<String, Chat>> = context.dataStore.data.map { prefs ->
@@ -433,6 +467,7 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps {
             prefs[Keys.maxAutoRounds] = config.maxAutoRounds
             prefs[Keys.contextLimitK] = config.contextLimitK
             prefs[Keys.sshConfig] = gson.toJson(config.sshConfig)
+            prefs[Keys.imageGenConfig] = gson.toJson(config.imageGenConfig)
         }
     }
 
@@ -1188,6 +1223,149 @@ class AppRepository(private val context: Context) : MemoryOps, NetOps, SSHOps {
      * SSH 工具实现：读取设置页配置的连接，执行远程命令并返回输出。
      * 密码/私钥二选一（私钥优先）；连接/执行均带超时；输出截断 8000 字符。
      */
+    // ── 生图（gpt-image-2 文生图 / 图生图）───────────────────────────────
+    override suspend fun generateImage(prompt: String, size: String, quality: String, n: Int): String =
+        withContext(Dispatchers.IO) {
+            val cfg = configFlow.first().imageGenConfig
+            cfg.errOrNull()?.let { return@withContext it }
+            val base = cfg.baseUrl.trim().trimEnd('/')
+            val body = buildString {
+                append("{\"model\":\"gpt-image-2\",\"prompt\":").append(jsonEsc(prompt))
+                append(",\"n\":").append(n.coerceIn(1, 4))
+                append(",\"size\":").append(jsonEsc(size.ifBlank { cfg.defaultSize }))
+                if (quality.isNotBlank()) append(",\"quality\":").append(jsonEsc(quality))
+                append("}")
+            }
+            val resp = httpPostJson("$base/images/generations", body, cfg.apiKey)
+            if (!resp.first) return@withContext "错误：文生图请求失败 —— ${resp.second}"
+            saveGeneratedImages(resp.second, "gen")
+        }
+
+    override suspend fun editImage(prompt: String, imageRef: String, size: String, quality: String, n: Int): String =
+        withContext(Dispatchers.IO) {
+            val cfg = configFlow.first().imageGenConfig
+            cfg.errOrNull()?.let { return@withContext it }
+            val base = cfg.baseUrl.trim().trimEnd('/')
+            val imgBytes = loadImageBytes(imageRef)
+                ?: return@withContext "错误：参考图无法读取（支持 http(s) / file:// / data:base64）"
+            val resp = httpPostMultipart("$base/images/edits", imgBytes, "ref.png", cfg, prompt, size, quality, n)
+            if (!resp.first) return@withContext "错误：图生图请求失败 —— ${resp.second}"
+            saveGeneratedImages(resp.second, "edit")
+        }
+
+    private fun ImageGenConfig.errOrNull(): String? = when {
+        !enabled -> "错误：生图工具未启用（请在设置 → 生图配置 中启用）"
+        apiKey.isBlank() -> "错误：生图未配置 API Key（请在设置 → 生图配置 中填写）"
+        else -> null
+    }
+
+    private fun jsonEsc(s: String): String =
+        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+
+    private fun httpPostJson(url: String, body: String, apiKey: String): Pair<Boolean, String> = try {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 15_000
+        conn.readTimeout = 240_000
+        conn.setRequestProperty("Authorization", "Bearer $apiKey")
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("Accept", "application/json")
+        conn.setRequestProperty("User-Agent", IMG_UA)
+        conn.doOutput = true
+        conn.outputStream.use { it.write(body.toByteArray()) }
+        val code = conn.responseCode
+        val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText() ?: ""
+        conn.disconnect()
+        if (code in 200..299) Pair(true, resp) else Pair(false, "HTTP $code: ${resp.take(240)}")
+    } catch (e: Exception) {
+        Pair(false, e.message ?: "网络错误")
+    }
+
+    private fun httpPostMultipart(
+        url: String, imgBytes: ByteArray, filename: String, cfg: ImageGenConfig,
+        prompt: String, size: String, quality: String, n: Int
+    ): Pair<Boolean, String> = try {
+        val boundary = "----uchat" + System.currentTimeMillis()
+        val body = ByteArrayOutputStream()
+        fun field(name: String, value: String) {
+            body.write(("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n").toByteArray())
+        }
+        field("model", "gpt-image-2")
+        field("prompt", prompt)
+        field("size", size.ifBlank { cfg.defaultSize })
+        if (quality.isNotBlank()) field("quality", quality)
+        field("n", n.coerceIn(1, 4).toString())
+        body.write(("--$boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"$filename\"\r\nContent-Type: image/png\r\n\r\n").toByteArray())
+        body.write(imgBytes)
+        body.write("\r\n".toByteArray())
+        body.write(("--$boundary--\r\n").toByteArray())
+
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 15_000
+        conn.readTimeout = 240_000
+        conn.setRequestProperty("Authorization", "Bearer ${cfg.apiKey}")
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        conn.setRequestProperty("Accept", "application/json")
+        conn.setRequestProperty("User-Agent", IMG_UA)
+        conn.doOutput = true
+        conn.outputStream.use { it.write(body.toByteArray()) }
+        val code = conn.responseCode
+        val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText() ?: ""
+        conn.disconnect()
+        if (code in 200..299) Pair(true, resp) else Pair(false, "HTTP $code: ${resp.take(240)}")
+    } catch (e: Exception) {
+        Pair(false, e.message ?: "网络错误")
+    }
+
+    private fun loadImageBytes(ref: String): ByteArray? {
+        return try {
+            when {
+                ref.startsWith("data:image") -> Base64.decode(ref.substringAfter(','), Base64.DEFAULT)
+                ref.startsWith("file://") -> File(URLDecoder.decode(ref.removePrefix("file://"), "UTF-8")).readBytes()
+                ref.startsWith("http") -> {
+                    val c = URL(ref).openConnection() as HttpURLConnection
+                    c.connectTimeout = 15_000
+                    c.readTimeout = 60_000
+                    c.instanceFollowRedirects = true
+                    c.setRequestProperty("User-Agent", IMG_UA)
+                    if (c.responseCode !in 200..299) { c.disconnect(); null }
+                    else c.inputStream.use { it.readBytes() }.also { c.disconnect() }
+                }
+                else -> null
+            }
+        } catch (_: Exception) { null }
+    }
+
+    /** 解析响应 data[].b64_json，存到 filesDir/images，返回 markdown 图片引用 */
+    private suspend fun saveGeneratedImages(respBody: String, prefix: String): String = withContext(Dispatchers.IO) {
+        try {
+            val json = JSONObject(respBody)
+            val arr = json.optJSONArray("data") ?: return@withContext "错误：响应缺少 data"
+            val dir = File(context.filesDir, "images").apply { mkdirs() }
+            val saved = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val b64 = arr.optJSONObject(i)?.optString("b64_json")
+                if (b64.isNullOrBlank()) continue
+                val bytes = Base64.decode(b64, Base64.DEFAULT)
+                if (bytes.isEmpty()) continue
+                val f = File(dir, "${prefix}_${System.currentTimeMillis()}_$i.png")
+                f.writeBytes(bytes)
+                saved.add(f.absolutePath)
+            }
+            if (saved.isEmpty()) return@withContext "错误：响应中未解析到图片数据"
+            buildString {
+                append("已生成 ").append(saved.size).append(" 张图片：\n")
+                saved.forEach { append("![](").append("file://").append(it).append(")\n") }
+                append("请在回复中原样保留这些图片引用（file:// 本地路径），聊天中会自动展示，点击放大后可长按保存到相册。")
+            }
+        } catch (e: Exception) {
+            "错误：图片保存失败 —— ${e.message}"
+        }
+    }
+
+    private val IMG_UA = "Mozilla/5.0 (Linux; Android 13; SM-S901B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
     override suspend fun sshExecute(command: String): String = withContext(Dispatchers.IO) {
         val ssh = configFlow.first().sshConfig
         if (!ssh.enabled) return@withContext "错误：SSH 工具未启用（请在设置 → SSH 中配置并启用）"

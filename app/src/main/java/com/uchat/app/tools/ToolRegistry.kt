@@ -28,6 +28,9 @@ class ToolRegistry(private val context: Context) {
     /** SSH 能力回调（ssh_execute 由上层注入，复用设置页配置的连接） */
     var sshOps: com.uchat.app.data.SSHOps? = null
 
+    /** 生图能力回调（generate_image / generate_image_edit 由上层注入，复用设置页生图配置） */
+    var imageGenOps: com.uchat.app.data.ImageGenOps? = null
+
     /** 工具定义列表（随每个请求发给模型的 tools 数组） */
     val definitions: List<ToolDef> = listOf(
         ToolDef(
@@ -84,6 +87,20 @@ class ToolRegistry(private val context: Context) {
             name = "send_file",
             description = "向用户发送一个文件，聊天中会展示为文件卡片供用户点击下载。用于把找到/生成的文件交付给用户：给出文件名（含扩展名）与可下载的 http(s) 地址（如 run_shell 中 wget 下载的文件，或你已知的直链）。文件类型由扩展名决定展示图标。",
             parameters = """{"type":"object","properties":{"name":{"type":"string","description":"文件名，需含扩展名，如 report.pdf 或 app.apk"},"url":{"type":"string","description":"文件的 http(s) 下载直链"}},"required":["name","url"]}""",
+            dangerLevel = 1
+        ),
+        ToolDef(
+            id = "generate_image",
+            name = "generate_image",
+            description = "文生图：根据文字描述生成图片（gpt-image-2）。需在设置 → 生图配置 中配置 API。图片保存到本地并在聊天中显示，点击放大后可长按保存到相册。",
+            parameters = """{"type":"object","properties":{"prompt":{"type":"string","description":"图片内容描述，尽量具体（主体/场景/风格/构图）"},"size":{"type":"string","description":"尺寸，如 1024x1024 或 512x512；留空用配置默认"},"quality":{"type":"string","enum":["low","medium","high"],"description":"生成质量，默认 medium"},"n":{"type":"integer","description":"生成数量（1-4），默认 1"}},"required":["prompt"]}""",
+            dangerLevel = 1
+        ),
+        ToolDef(
+            id = "generate_image_edit",
+            name = "generate_image_edit",
+            description = "图生图：基于参考图修改/重绘生成新图（gpt-image-2）。需在设置 → 生图配置 中配置 API。image 参数为参考图（http(s) 直链 / file:// 本地路径 / data:base64），prompt 描述修改目标。图片保存到本地并在聊天中显示。",
+            parameters = """{"type":"object","properties":{"prompt":{"type":"string","description":"对参考图的修改/重绘描述"},"image":{"type":"string","description":"参考图：http(s) 直链 / file:// 本地路径 / data:base64"},"size":{"type":"string","description":"尺寸，如 1024x1024；留空用配置默认"},"quality":{"type":"string","enum":["low","medium","high"],"description":"生成质量，默认 medium"},"n":{"type":"integer","description":"生成数量（1-4），默认 1"}},"required":["prompt","image"]}""",
             dangerLevel = 1
         ),
         ToolDef(
@@ -165,6 +182,29 @@ class ToolRegistry(private val context: Context) {
                 !url.startsWith("http://") && !url.startsWith("https://") -> "错误：url 必须是 http(s) 下载直链"
                 else -> "【文件卡片】$name|$url"
             }
+        }
+        "generate_image" -> {
+            val prompt = parseArg(argumentsJson, "prompt")
+            if (prompt.isBlank()) "错误：缺少参数 prompt"
+            else imageGenOps?.generateImage(
+                prompt,
+                parseArg(argumentsJson, "size"),
+                parseArg(argumentsJson, "quality"),
+                parseArg(argumentsJson, "n").toIntOrNull() ?: 1
+            ) ?: "错误：生图服务未就绪（请在设置 → 生图配置 中配置）"
+        }
+        "generate_image_edit" -> {
+            val prompt = parseArg(argumentsJson, "prompt")
+            val image = parseArg(argumentsJson, "image")
+            if (prompt.isBlank()) "错误：缺少参数 prompt"
+            else if (image.isBlank()) "错误：缺少参数 image（参考图）"
+            else imageGenOps?.editImage(
+                prompt,
+                image,
+                parseArg(argumentsJson, "size"),
+                parseArg(argumentsJson, "quality"),
+                parseArg(argumentsJson, "n").toIntOrNull() ?: 1
+            ) ?: "错误：生图服务未就绪（请在设置 → 生图配置 中配置）"
         }
         "ssh_execute" -> {
             val command = parseArg(argumentsJson, "command").trim()
